@@ -371,14 +371,15 @@ class MHCTrainer(Trainer):
     ) -> float:
         hidden_flat = hidden.reshape(-1, hidden.size(-1))
         labels_flat = labels.reshape(-1)
-        total_tokens = labels_flat.numel()
-        if total_tokens == 0:
+        num_positions = labels_flat.numel()
+        valid_tokens = (labels_flat != -100).sum().item()
+        if valid_tokens == 0:
             return 0.0
         total_loss_val = 0.0
         head_dtype = lm_head.weight.dtype
         grad_accum = self.args.gradient_accumulation_steps
-        for start in range(0, total_tokens, self.logits_chunk_size):
-            end = min(start + self.logits_chunk_size, total_tokens)
+        for start in range(0, num_positions, self.logits_chunk_size):
+            end = min(start + self.logits_chunk_size, num_positions)
             chunk = hidden_flat[start:end]
             if chunk.dtype != head_dtype:
                 chunk = chunk.to(head_dtype)
@@ -391,10 +392,10 @@ class MHCTrainer(Trainer):
                 ignore_index=-100,
             )
             total_loss_val += chunk_loss.item()
-            chunk_loss = chunk_loss / float(total_tokens * grad_accum)
-            self.accelerator.backward(chunk_loss, retain_graph=end < total_tokens)
+            chunk_loss = chunk_loss / float(valid_tokens * grad_accum)
+            self.accelerator.backward(chunk_loss, retain_graph=end < num_positions)
             del logits, chunk_loss
-        return total_loss_val / max(total_tokens, 1)
+        return total_loss_val / max(valid_tokens, 1)
 
     def _training_step_chunked(
         self, model: torch.nn.Module, input_ids: torch.Tensor, labels: torch.Tensor
