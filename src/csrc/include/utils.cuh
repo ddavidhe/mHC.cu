@@ -22,28 +22,12 @@ __global__ __launch_bounds__(BLOCK_SIZE, 2) void float_to_bf16_kernel(floatX* __
     }
 }
 
-template<int BLOCK_SIZE>
-__global__ __launch_bounds__(BLOCK_SIZE,
-                             2) void bf16_to_float_kernel(float* __restrict__ out,
-                                                          const floatX* __restrict__ inp,
-                                                          int size) {
-    int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    if (idx < size) {
-        out[idx] = (float)inp[idx];
-    }
-}
-
 inline void float_to_bf16(floatX* out, const float* inp, int size, cudaStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 256;
     int num_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
     float_to_bf16_kernel<BLOCK_SIZE><<<num_blocks, BLOCK_SIZE, 0, stream>>>(out, inp, size);
 }
 
-inline void bf16_to_float(float* out, const floatX* inp, int size, cudaStream_t stream = nullptr) {
-    constexpr int BLOCK_SIZE = 256;
-    int num_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    bf16_to_float_kernel<BLOCK_SIZE><<<num_blocks, BLOCK_SIZE, 0, stream>>>(out, inp, size);
-}
 
 __device__ __forceinline__ float fast_exp(float x) {
     constexpr float kExpClamp = 20.0f;

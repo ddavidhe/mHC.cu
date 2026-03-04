@@ -275,15 +275,16 @@ bool test_dynamic_path() {
                                     h_rmsnorm_weight, B, n, C, 1e-5f);
 
     float *d_x, *d_H_pre, *d_H_post, *d_M, *d_out, *d_rms;
-    floatX *d_agg, *d_norm, *d_rmsnorm_w;
+    float *d_agg, *d_norm;
+    floatX* d_rmsnorm_w;
 
     CHECK_CUDA(cudaMalloc(&d_x, B * n * C * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_H_pre, B * n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_H_post, B * n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_M, B * n * n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_out, B * n * C * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_agg, B * C * sizeof(floatX)));
-    CHECK_CUDA(cudaMalloc(&d_norm, B * C * sizeof(floatX)));
+    CHECK_CUDA(cudaMalloc(&d_agg, B * C * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_norm, B * C * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_rms, B * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_rmsnorm_w, C * sizeof(floatX)));
 

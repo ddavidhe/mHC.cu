@@ -32,7 +32,7 @@ int main() {
         h_M[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
 
     float *d_x, *d_H_pre, *d_H_post, *d_M, *d_H_pre_act, *d_H_post_act, *d_out;
-    floatX *d_agg_bf16, *d_y_bf16;
+    float *d_agg_f32, *d_y_f32;
 
     CHECK_CUDA(cudaMalloc(&d_x, B * n * C * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_H_pre, n * sizeof(float)));
@@ -40,32 +40,22 @@ int main() {
     CHECK_CUDA(cudaMalloc(&d_M, n * n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_H_pre_act, n * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_H_post_act, n * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_agg_bf16, B * C * sizeof(floatX)));
-    CHECK_CUDA(cudaMalloc(&d_y_bf16, B * C * sizeof(floatX)));
+    CHECK_CUDA(cudaMalloc(&d_agg_f32, B * C * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&d_y_f32, B * C * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_out, B * n * C * sizeof(float)));
 
     CHECK_CUDA(cudaMemcpy(d_x, h_x, B * n * C * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_H_pre, h_H_pre, n * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_H_post, h_H_post, n * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_M, h_M, n * n * sizeof(float), cudaMemcpyHostToDevice));
-
-    float* h_y_tmp = (float*)malloc(B * C * sizeof(float));
-    for (int i = 0; i < B * C; i++)
-        h_y_tmp[i] = h_y[i];
-    float* d_y_f32;
-    CHECK_CUDA(cudaMalloc(&d_y_f32, B * C * sizeof(float)));
-    CHECK_CUDA(cudaMemcpy(d_y_f32, h_y_tmp, B * C * sizeof(float), cudaMemcpyHostToDevice));
-    float_to_bf16(d_y_bf16, d_y_f32, B * C);
+    CHECK_CUDA(cudaMemcpy(d_y_f32, h_y, B * C * sizeof(float), cudaMemcpyHostToDevice));
 
     printf("Stream Ops Test\n");
     printf("=======================\nB=%d, n=%d, C=%d\n\n", B, n, C);
 
-    stream_aggregate_bf16_fused_sigmoid(d_agg_bf16, d_H_pre_act, d_x, d_H_pre, B, n, C);
+    stream_aggregate_bf16_fused_sigmoid(d_agg_f32, d_H_pre_act, d_x, d_H_pre, B, n, C);
     float* h_agg_gpu = (float*)malloc(B * C * sizeof(float));
-    floatX* h_agg_bf16 = (floatX*)malloc(B * C * sizeof(floatX));
-    CHECK_CUDA(cudaMemcpy(h_agg_bf16, d_agg_bf16, B * C * sizeof(floatX), cudaMemcpyDeviceToHost));
-    for (int i = 0; i < B * C; i++)
-        h_agg_gpu[i] = (float)h_agg_bf16[i];
+    CHECK_CUDA(cudaMemcpy(h_agg_gpu, d_agg_f32, B * C * sizeof(float), cudaMemcpyDeviceToHost));
 
     float* h_agg_cpu = (float*)malloc(B * C * sizeof(float));
     for (int bc = 0; bc < B * C; bc++) {
@@ -81,7 +71,7 @@ int main() {
     printf("stream_aggregate_bf16_fused_sigmoid: max diff = %.6e %s\n", agg_diff,
            agg_diff < 0.01f ? "PASSED" : "FAILED");
 
-    stream_distribute_mix_add_fused(d_out, d_H_post_act, d_x, d_y_bf16, d_H_post, d_M, B, n, C);
+    stream_distribute_mix_add_fused(d_out, d_H_post_act, d_x, d_y_f32, d_H_post, d_M, B, n, C);
     float* h_out_gpu = (float*)malloc(B * n * C * sizeof(float));
     CHECK_CUDA(cudaMemcpy(h_out_gpu, d_out, B * n * C * sizeof(float), cudaMemcpyDeviceToHost));
 
@@ -107,8 +97,7 @@ int main() {
     cudaFree(d_M);
     cudaFree(d_H_pre_act);
     cudaFree(d_H_post_act);
-    cudaFree(d_agg_bf16);
-    cudaFree(d_y_bf16);
+    cudaFree(d_agg_f32);
     cudaFree(d_y_f32);
     cudaFree(d_out);
     free(h_x);
@@ -117,11 +106,9 @@ int main() {
     free(h_H_post);
     free(h_M);
     free(h_agg_gpu);
-    free(h_agg_bf16);
     free(h_agg_cpu);
     free(h_out_gpu);
     free(h_out_cpu);
-    free(h_y_tmp);
 
     return 0;
 }

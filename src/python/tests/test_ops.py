@@ -41,7 +41,7 @@ def test_rmsnorm():
     out = rmsnorm(inp, weight)
 
     assert out.shape == (B, C)
-    assert out.dtype == torch.bfloat16
+    assert out.dtype == torch.float32
 
 
 def test_rmsnorm_gradient():

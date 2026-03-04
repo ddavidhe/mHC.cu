@@ -439,6 +439,9 @@ class CausalSelfAttention(nn.Module):
             k = self._apply_rope(k, cos, sin)
 
         sdp_ctx = _sdp_kernel_context(self.sdp_kernel, q.device)
+        input_dtype = q.dtype
+        if q.device.type == "cuda" and q.dtype == torch.float32:
+            q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
         with sdp_ctx:
             attn = F.scaled_dot_product_attention(
                 q,
@@ -447,7 +450,7 @@ class CausalSelfAttention(nn.Module):
                 dropout_p=self.dropout if self.training else 0.0,
                 is_causal=True,
             )
-        out = attn.permute(0, 2, 1, 3).reshape(bsz, seq_len, dim)
+        out = attn.to(input_dtype).permute(0, 2, 1, 3).reshape(bsz, seq_len, dim)
         out = self.proj(out)
         if self.dropout:
             out = F.dropout(out, p=self.dropout, training=self.training)

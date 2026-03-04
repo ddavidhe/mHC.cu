@@ -44,16 +44,16 @@ int main() {
             h_H[i] = 0.0f;
 
         float *d_x, *d_H, *d_H_activated;
-        floatX* d_out;
+        float* d_out;
         CHECK_CUDA(cudaMalloc(&d_x, B * n * C * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_H, n * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_H_activated, n * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&d_out, B * C * sizeof(floatX)));
+        CHECK_CUDA(cudaMalloc(&d_out, B * C * sizeof(float)));
 
         CHECK_CUDA(cudaMemcpy(d_x, h_x, B * n * C * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_H, h_H, n * sizeof(float), cudaMemcpyHostToDevice));
 
-        size_t bytes = (B * n * C + n) * sizeof(float) + B * C * sizeof(floatX);
+        size_t bytes = (B * n * C + n) * sizeof(float) + B * C * sizeof(float);
 
         BenchTimer timer;
         float total_time = 0.0f;
@@ -89,7 +89,7 @@ int main() {
         int C = configs[c][2];
 
         float* h_x = (float*)malloc(B * n * C * sizeof(float));
-        floatX* h_y_norm = (floatX*)malloc(B * C * sizeof(floatX));
+        float* h_y_norm = (float*)malloc(B * C * sizeof(float));
         float* h_H = (float*)malloc(n * sizeof(float));
         float* h_M = (float*)malloc(n * n * sizeof(float));
 
@@ -97,27 +97,27 @@ int main() {
         for (int i = 0; i < B * n * C; i++)
             h_x[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
         for (int i = 0; i < B * C; i++)
-            h_y_norm[i] = (floatX)((float)rand() / RAND_MAX * 2.0f - 1.0f);
+            h_y_norm[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
         for (int i = 0; i < n; i++)
             h_H[i] = 0.0f;
         for (int i = 0; i < n * n; i++)
             h_M[i] = 1.0f / n;
 
         float *d_x, *d_H, *d_H_activated, *d_M, *d_out;
-        floatX* d_y_norm;
+        float* d_y_norm;
         CHECK_CUDA(cudaMalloc(&d_x, B * n * C * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&d_y_norm, B * C * sizeof(floatX)));
+        CHECK_CUDA(cudaMalloc(&d_y_norm, B * C * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_H, n * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_H_activated, n * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_M, n * n * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_out, B * n * C * sizeof(float)));
 
         CHECK_CUDA(cudaMemcpy(d_x, h_x, B * n * C * sizeof(float), cudaMemcpyHostToDevice));
-        CHECK_CUDA(cudaMemcpy(d_y_norm, h_y_norm, B * C * sizeof(floatX), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_y_norm, h_y_norm, B * C * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_H, h_H, n * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_M, h_M, n * n * sizeof(float), cudaMemcpyHostToDevice));
 
-        size_t bytes = (B * n * C + n * n + n) * sizeof(float) + B * C * sizeof(floatX) +
+        size_t bytes = (B * n * C + n * n + n) * sizeof(float) + B * C * sizeof(float) +
                        B * n * C * sizeof(float);
 
         BenchTimer timer;

@@ -29,14 +29,14 @@ int main() {
         int N = configs[c][0];
         int C = configs[c][1];
 
-        floatX* h_inp = (floatX*)malloc(N * C * sizeof(floatX));
+        float* h_inp = (float*)malloc(N * C * sizeof(float));
         floatX* h_weight = (floatX*)malloc(C * sizeof(floatX));
         float* h_grad = (float*)malloc(N * C * sizeof(float));
         float* h_rms = (float*)malloc(N * sizeof(float));
 
         srand(42);
         for (int i = 0; i < N * C; i++) {
-            h_inp[i] = (floatX)((float)rand() / RAND_MAX * 2.0f - 1.0f);
+            h_inp[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
             h_grad[i] = (float)rand() / RAND_MAX * 2.0f - 1.0f;
         }
         for (int i = 0; i < C; i++) {
@@ -45,28 +45,29 @@ int main() {
         for (int i = 0; i < N; i++) {
             float sum_sq = 0.0f;
             for (int j = 0; j < C; j++) {
-                float v = (float)h_inp[i * C + j];
+                float v = h_inp[i * C + j];
                 sum_sq += v * v;
             }
             h_rms[i] = sqrtf(sum_sq / (float)C + 1e-5f);
         }
 
-        floatX *d_inp, *d_weight;
+        float* d_inp;
+        floatX* d_weight;
         float *d_grad, *d_rms, *d_d_inp, *d_d_weight;
 
-        CHECK_CUDA(cudaMalloc(&d_inp, N * C * sizeof(floatX)));
+        CHECK_CUDA(cudaMalloc(&d_inp, N * C * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_weight, C * sizeof(floatX)));
         CHECK_CUDA(cudaMalloc(&d_grad, N * C * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_rms, N * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_d_inp, N * C * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&d_d_weight, C * sizeof(float)));
 
-        CHECK_CUDA(cudaMemcpy(d_inp, h_inp, N * C * sizeof(floatX), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_inp, h_inp, N * C * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_weight, h_weight, C * sizeof(floatX), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_grad, h_grad, N * C * sizeof(float), cudaMemcpyHostToDevice));
         CHECK_CUDA(cudaMemcpy(d_rms, h_rms, N * sizeof(float), cudaMemcpyHostToDevice));
 
-        size_t bytes_read = (size_t)N * C * sizeof(floatX) + (size_t)C * sizeof(floatX) +
+        size_t bytes_read = (size_t)N * C * sizeof(float) + (size_t)C * sizeof(floatX) +
                             (size_t)N * C * sizeof(float) + (size_t)N * sizeof(float);
         size_t bytes_write = (size_t)N * C * sizeof(float) + (size_t)C * sizeof(float);
         size_t total_bytes = bytes_read + bytes_write;
