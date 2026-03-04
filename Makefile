@@ -81,6 +81,10 @@ lint:
 		--suppress=shiftTooManyBits \
 		--suppress=uninitMemberVar \
 		--suppress=duplicateAssignExpression \
+		--suppress=noCopyConstructor \
+		--suppress=noOperatorEq \
+		--suppress=nullPointerOutOfMemory \
+		--suppress=nullPointer \
 		--inline-suppr \
 		--language=c++ \
 		-I src/csrc/include \

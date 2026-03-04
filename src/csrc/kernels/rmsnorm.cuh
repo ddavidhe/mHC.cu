@@ -11,9 +11,11 @@ namespace cg = cooperative_groups;
 namespace mhc {
 
 template<int BLOCK_SIZE, bool OUTPUT_RMS = false>
-__global__ void rmsnorm_kernel(floatX* __restrict__ out, float* __restrict__ rms_out,
-                               const floatX* __restrict__ inp, const floatX* __restrict__ weight,
-                               int N, int C, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void rmsnorm_kernel(floatX* __restrict__ out,
+                                                                float* __restrict__ rms_out,
+                                                                const floatX* __restrict__ inp,
+                                                                const floatX* __restrict__ weight,
+                                                                int N, int C, float eps) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 
@@ -69,10 +71,9 @@ __global__ void rmsnorm_kernel(floatX* __restrict__ out, float* __restrict__ rms
 }
 
 template<int BLOCK_SIZE, bool OUTPUT_RMS = false>
-__global__ void rmsnorm_kernel_vectorized(floatX* __restrict__ out, float* __restrict__ rms_out,
-                                          const floatX* __restrict__ inp,
-                                          const floatX* __restrict__ weight, int N, int C,
-                                          float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void rmsnorm_kernel_vectorized(
+    floatX* __restrict__ out, float* __restrict__ rms_out, const floatX* __restrict__ inp,
+    const floatX* __restrict__ weight, int N, int C, float eps) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 
@@ -231,11 +232,10 @@ inline void rmsnorm_forward_with_rms(floatX* out, float* rms_out, const floatX* 
 #endif
 }
 template<int BLOCK_SIZE>
-__global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __restrict__ d_weight,
-                                        const float* __restrict__ grad,
-                                        const floatX* __restrict__ inp,
-                                        const floatX* __restrict__ weight,
-                                        const float* __restrict__ rms, int N, int C) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void rmsnorm_backward_kernel(
+    float* __restrict__ d_inp, float* __restrict__ d_weight, const float* __restrict__ grad,
+    const floatX* __restrict__ inp, const floatX* __restrict__ weight,
+    const float* __restrict__ rms, int N, int C) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 

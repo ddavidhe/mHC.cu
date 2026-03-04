@@ -159,6 +159,18 @@ torch::Tensor sinkhorn_knopp_bwd(torch::Tensor grad, torch::Tensor out, torch::T
     return d_inp;
 }
 
+torch::Tensor sinkhorn_knopp_bwd_batched(torch::Tensor grad, torch::Tensor M_inp, int iters,
+                                         float eps) {
+    CHECK_INPUT(grad);
+    CHECK_INPUT(M_inp);
+    int B = grad.size(0), n = grad.size(1);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    auto d_inp = torch::empty_like(M_inp);
+    sinkhorn_knopp_backward_batched(d_inp.data_ptr<float>(), grad.data_ptr<float>(),
+                                    M_inp.data_ptr<float>(), B, n, iters, eps, stream);
+    return d_inp;
+}
+
 std::tuple<torch::Tensor, torch::Tensor> rmsnorm_fwd(torch::Tensor inp, torch::Tensor weight,
                                                      float eps) {
     CHECK_INPUT(inp);
@@ -498,14 +510,11 @@ mhc_layer_fwd_dynamic(torch::Tensor x_expanded, torch::Tensor rmsnorm_weight,
     auto y_norm_bf16 = torch::empty({B, C}, x_expanded.options().dtype(torch::kBFloat16));
     auto output = torch::empty({B, n, C}, x_expanded.options().dtype(torch::kFloat32));
 
-    stream_aggregate_bf16_dynamic(reinterpret_cast<floatX*>(x_agg_bf16.data_ptr<at::BFloat16>()),
-                                  x_f32.data_ptr<float>(), H_pre_activated.data_ptr<float>(), B, n,
-                                  C, stream);
-
-    rmsnorm_forward_with_rms(
-        reinterpret_cast<floatX*>(y_norm_bf16.data_ptr<at::BFloat16>()), rms.data_ptr<float>(),
-        reinterpret_cast<const floatX*>(x_agg_bf16.data_ptr<at::BFloat16>()),
-        reinterpret_cast<const floatX*>(rmsnorm_weight.data_ptr<at::BFloat16>()), B, C, eps,
+    fused_aggregate_rmsnorm_dynamic(
+        reinterpret_cast<floatX*>(y_norm_bf16.data_ptr<at::BFloat16>()),
+        reinterpret_cast<floatX*>(x_agg_bf16.data_ptr<at::BFloat16>()), rms.data_ptr<float>(),
+        x_f32.data_ptr<float>(), H_pre_activated.data_ptr<float>(),
+        reinterpret_cast<const floatX*>(rmsnorm_weight.data_ptr<at::BFloat16>()), B, n, C, eps,
         stream);
 
     stream_distribute_mix_add_fused_dynamic(
@@ -517,7 +526,7 @@ mhc_layer_fwd_dynamic(torch::Tensor x_expanded, torch::Tensor rmsnorm_weight,
             y_norm_bf16, x_flat_bf16, rms_h};
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 mhc_dynamic_h_fwd(torch::Tensor x_expanded, torch::Tensor phi_concat_bf16, float alpha_pre,
                   float alpha_post, float alpha_res, torch::Tensor b_pre, torch::Tensor b_post,
                   torch::Tensor b_res, int sinkhorn_iters, float eps) {
@@ -579,7 +588,7 @@ mhc_dynamic_h_fwd(torch::Tensor x_expanded, torch::Tensor phi_concat_bf16, float
     sinkhorn_knopp_forward_batched(M.data_ptr<float>(), H_res_exp.data_ptr<float>(), B, n,
                                    sinkhorn_iters, eps, stream);
 
-    return {H_pre_activated, H_post_activated, M};
+    return {H_pre_activated, H_post_activated, M, rms_h};
 }
 
 torch::Tensor mhc_dynamic_aggregate_fwd(torch::Tensor x_expanded, torch::Tensor H_pre_activated) {
@@ -609,21 +618,15 @@ std::tuple<torch::Tensor, torch::Tensor> mhc_dynamic_aggregate_bwd(torch::Tensor
     int B = x_expanded.size(0), n = x_expanded.size(1), C = x_expanded.size(2);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    constexpr int BLOCK_SIZE = 256;
-    int workspace_num_blocks = std::min(128, (B * C + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    auto workspace_dH =
-        torch::empty({workspace_num_blocks * n}, grad.options().dtype(torch::kFloat32));
-
     auto grad_f32 = grad.to(torch::kFloat32).contiguous();
     auto x_f32 = x_expanded.to(torch::kFloat32).contiguous();
 
     auto d_x = torch::empty({B, n, C}, grad.options().dtype(torch::kFloat32));
     auto d_H_pre = torch::empty({B, n}, grad.options().dtype(torch::kFloat32));
 
-    stream_aggregate_backward(d_x.data_ptr<float>(), d_H_pre.data_ptr<float>(),
-                              grad_f32.data_ptr<float>(), x_f32.data_ptr<float>(),
-                              H_pre_activated.data_ptr<float>(), B, n, C,
-                              workspace_dH.data_ptr<float>(), workspace_num_blocks, stream);
+    stream_aggregate_backward_dynamic(d_x.data_ptr<float>(), d_H_pre.data_ptr<float>(),
+                                      grad_f32.data_ptr<float>(), x_f32.data_ptr<float>(),
+                                      H_pre_activated.data_ptr<float>(), B, n, C, stream);
 
     return {d_x, d_H_pre};
 }
@@ -662,13 +665,6 @@ mhc_dynamic_mix_bwd(torch::Tensor grad_output, torch::Tensor x_expanded, torch::
     int B = x_expanded.size(0), n = x_expanded.size(1), C = x_expanded.size(2);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    constexpr int BLOCK_SIZE = 256;
-    int workspace_num_blocks = std::min(128, (B * C + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    auto workspace_dH =
-        torch::empty({workspace_num_blocks * n}, grad_output.options().dtype(torch::kFloat32));
-    auto workspace_dM =
-        torch::empty({workspace_num_blocks * n * n}, grad_output.options().dtype(torch::kFloat32));
-
     auto grad_f32 = grad_output.to(torch::kFloat32).contiguous();
     auto x_f32 = x_expanded.to(torch::kFloat32).contiguous();
     auto y_norm_f32 = y_norm_bf16.to(torch::kFloat32).contiguous();
@@ -678,12 +674,11 @@ mhc_dynamic_mix_bwd(torch::Tensor grad_output, torch::Tensor x_expanded, torch::
     auto d_M = torch::empty({B, n, n}, grad_output.options().dtype(torch::kFloat32));
     auto d_H_post = torch::empty({B, n}, grad_output.options().dtype(torch::kFloat32));
 
-    stream_distribute_mix_backward_fused(
+    stream_distribute_mix_backward_fused_dynamic(
         d_x.data_ptr<float>(), d_y_norm.data_ptr<float>(), d_M.data_ptr<float>(),
         d_H_post.data_ptr<float>(), grad_f32.data_ptr<float>(), x_f32.data_ptr<float>(),
         y_norm_f32.data_ptr<float>(), M.data_ptr<float>(), H_post_activated.data_ptr<float>(), B, n,
-        C, workspace_dM.data_ptr<float>(), workspace_dH.data_ptr<float>(), workspace_num_blocks,
-        stream);
+        C, stream);
 
     return {d_x, d_y_norm, d_H_post, d_M};
 }
@@ -706,28 +701,26 @@ mhc_layer_bwd_dynamic(torch::Tensor grad_output, torch::Tensor x_expanded,
     int B = x_expanded.size(0), n = x_expanded.size(1), C = x_expanded.size(2);
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-    constexpr int BLOCK_SIZE = 256;
-    int workspace_num_blocks = std::min(128, (B * C + BLOCK_SIZE - 1) / BLOCK_SIZE);
-    auto workspace_dH =
-        torch::empty({workspace_num_blocks * n}, grad_output.options().dtype(torch::kFloat32));
-    auto workspace_dM =
-        torch::empty({workspace_num_blocks * n * n}, grad_output.options().dtype(torch::kFloat32));
-
-    auto grad_f32 = grad_output.to(torch::kFloat32).contiguous();
-    auto x_f32 = x_expanded.to(torch::kFloat32).contiguous();
-    auto y_norm_f32 = y_norm_bf16.to(torch::kFloat32).contiguous();
+    auto grad_f32 = (grad_output.scalar_type() == torch::kFloat32)
+                        ? grad_output.contiguous()
+                        : grad_output.to(torch::kFloat32).contiguous();
+    auto x_f32 = (x_expanded.scalar_type() == torch::kFloat32)
+                     ? x_expanded.contiguous()
+                     : x_expanded.to(torch::kFloat32).contiguous();
+    auto y_norm_f32 = (y_norm_bf16.scalar_type() == torch::kFloat32)
+                          ? y_norm_bf16.contiguous()
+                          : y_norm_bf16.to(torch::kFloat32).contiguous();
 
     auto d_x_mix = torch::empty({B, n, C}, grad_output.options().dtype(torch::kFloat32));
     auto d_y_norm = torch::empty({B, C}, grad_output.options().dtype(torch::kFloat32));
     auto d_M = torch::empty({B, n, n}, grad_output.options().dtype(torch::kFloat32));
     auto d_H_post = torch::empty({B, n}, grad_output.options().dtype(torch::kFloat32));
 
-    stream_distribute_mix_backward_fused(
+    stream_distribute_mix_backward_fused_dynamic(
         d_x_mix.data_ptr<float>(), d_y_norm.data_ptr<float>(), d_M.data_ptr<float>(),
         d_H_post.data_ptr<float>(), grad_f32.data_ptr<float>(), x_f32.data_ptr<float>(),
         y_norm_f32.data_ptr<float>(), M.data_ptr<float>(), H_post_activated.data_ptr<float>(), B, n,
-        C, workspace_dM.data_ptr<float>(), workspace_dH.data_ptr<float>(), workspace_num_blocks,
-        stream);
+        C, stream);
 
     auto d_x_agg = torch::empty({B, C}, grad_output.options().dtype(torch::kFloat32));
     auto d_rmsnorm_weight = torch::zeros({C}, grad_output.options().dtype(torch::kFloat32));
@@ -737,21 +730,117 @@ mhc_layer_bwd_dynamic(torch::Tensor grad_output, torch::Tensor x_expanded,
                      reinterpret_cast<const floatX*>(rmsnorm_weight.data_ptr<at::BFloat16>()),
                      rms.data_ptr<float>(), B, C, stream);
 
-    auto d_x_from_agg = torch::empty({B, n, C}, grad_output.options().dtype(torch::kFloat32));
     auto d_H_pre = torch::empty({B, n}, grad_output.options().dtype(torch::kFloat32));
-    stream_aggregate_backward(d_x_from_agg.data_ptr<float>(), d_H_pre.data_ptr<float>(),
-                              d_x_agg.data_ptr<float>(), x_f32.data_ptr<float>(),
-                              H_pre_activated.data_ptr<float>(), B, n, C,
-                              workspace_dH.data_ptr<float>(), workspace_num_blocks, stream);
+    // Accumulate d_x_from_agg directly into d_x_mix, avoiding a separate addition kernel
+    stream_aggregate_backward_dynamic<true>(d_x_mix.data_ptr<float>(), d_H_pre.data_ptr<float>(),
+                                            d_x_agg.data_ptr<float>(), x_f32.data_ptr<float>(),
+                                            H_pre_activated.data_ptr<float>(), B, n, C, stream);
 
-    auto d_x_expanded = d_x_mix + d_x_from_agg;
+    return {d_x_mix, d_rmsnorm_weight, d_H_pre, d_H_post, d_M};
+}
 
-    return {d_x_expanded, d_rmsnorm_weight, d_H_pre, d_H_post, d_M};
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor>
+mhc_h_backward_pre(torch::Tensor d_H_pre, torch::Tensor d_H_post, torch::Tensor H_pre_activated,
+                   torch::Tensor H_post_activated, torch::Tensor p_concat, torch::Tensor rms_inv,
+                   float alpha_res, torch::Tensor b_res, int n) {
+    CHECK_INPUT(d_H_pre);
+    CHECK_INPUT(d_H_post);
+    CHECK_INPUT(H_pre_activated);
+    CHECK_INPUT(H_post_activated);
+    CHECK_INPUT(p_concat);
+    CHECK_INPUT(rms_inv);
+    CHECK_INPUT(b_res);
+
+    int B = d_H_pre.size(0);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    auto d_H_pre_f32 = d_H_pre.to(torch::kFloat32).contiguous();
+    auto d_H_post_f32 = d_H_post.to(torch::kFloat32).contiguous();
+    auto H_pre_act_f32 = H_pre_activated.to(torch::kFloat32).contiguous();
+    auto H_post_act_f32 = H_post_activated.to(torch::kFloat32).contiguous();
+    auto p_concat_f32 = p_concat.to(torch::kFloat32).contiguous();
+    auto rms_inv_f32 = rms_inv.to(torch::kFloat32).contiguous();
+    auto b_res_f32 = b_res.to(torch::kFloat32).contiguous();
+
+    auto d_tilde_pre = torch::empty({B, n}, d_H_pre.options().dtype(torch::kFloat32));
+    auto d_tilde_post = torch::empty({B, n}, d_H_pre.options().dtype(torch::kFloat32));
+    auto H_res_exp = torch::empty({B, n, n}, d_H_pre.options().dtype(torch::kFloat32));
+
+    fused_h_backward_pre(d_tilde_pre.data_ptr<float>(), d_tilde_post.data_ptr<float>(),
+                         H_res_exp.data_ptr<float>(), d_H_pre_f32.data_ptr<float>(),
+                         d_H_post_f32.data_ptr<float>(), H_pre_act_f32.data_ptr<float>(),
+                         H_post_act_f32.data_ptr<float>(), p_concat_f32.data_ptr<float>(),
+                         rms_inv_f32.data_ptr<float>(), alpha_res, b_res_f32.data_ptr<float>(), B,
+                         n, stream);
+
+    return {d_tilde_pre, d_tilde_post, H_res_exp};
+}
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+mhc_h_backward_post(torch::Tensor d_H_res_exp, torch::Tensor H_res_exp, torch::Tensor d_tilde_pre,
+                    torch::Tensor d_tilde_post, torch::Tensor p_concat, torch::Tensor rms_inv,
+                    float alpha_pre, float alpha_post, float alpha_res, int n) {
+    CHECK_INPUT(d_H_res_exp);
+    CHECK_INPUT(H_res_exp);
+    CHECK_INPUT(d_tilde_pre);
+    CHECK_INPUT(d_tilde_post);
+    CHECK_INPUT(p_concat);
+    CHECK_INPUT(rms_inv);
+
+    int B = d_H_res_exp.size(0);
+    int n_sq = n * n;
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    auto d_H_res_exp_f32 = d_H_res_exp.to(torch::kFloat32).contiguous();
+    auto H_res_exp_f32 = H_res_exp.to(torch::kFloat32).contiguous();
+    auto d_tilde_pre_f32 = d_tilde_pre.to(torch::kFloat32).contiguous();
+    auto d_tilde_post_f32 = d_tilde_post.to(torch::kFloat32).contiguous();
+    auto p_concat_f32 = p_concat.to(torch::kFloat32).contiguous();
+    auto rms_inv_f32 = rms_inv.to(torch::kFloat32).contiguous();
+
+    auto d_p_pre = torch::empty({B, n}, d_H_res_exp.options().dtype(torch::kFloat32));
+    auto d_p_post = torch::empty({B, n}, d_H_res_exp.options().dtype(torch::kFloat32));
+    auto d_p_res_flat = torch::empty({B, n_sq}, d_H_res_exp.options().dtype(torch::kFloat32));
+    auto d_b_pre = torch::zeros({n}, d_H_res_exp.options().dtype(torch::kFloat32));
+    auto d_b_post = torch::zeros({n}, d_H_res_exp.options().dtype(torch::kFloat32));
+    auto d_b_res = torch::zeros({n, n}, d_H_res_exp.options().dtype(torch::kFloat32));
+    auto d_alpha_pre_t = torch::zeros({1}, d_H_res_exp.options().dtype(torch::kFloat32));
+    auto d_alpha_post_t = torch::zeros({1}, d_H_res_exp.options().dtype(torch::kFloat32));
+    auto d_alpha_res_t = torch::zeros({1}, d_H_res_exp.options().dtype(torch::kFloat32));
+    auto d_r = torch::empty({B}, d_H_res_exp.options().dtype(torch::kFloat32));
+
+    fused_h_backward_post(
+        d_p_pre.data_ptr<float>(), d_p_post.data_ptr<float>(), d_p_res_flat.data_ptr<float>(),
+        d_b_pre.data_ptr<float>(), d_b_post.data_ptr<float>(), d_b_res.data_ptr<float>(),
+        d_alpha_pre_t.data_ptr<float>(), d_alpha_post_t.data_ptr<float>(),
+        d_alpha_res_t.data_ptr<float>(), d_r.data_ptr<float>(), d_H_res_exp_f32.data_ptr<float>(),
+        H_res_exp_f32.data_ptr<float>(), d_tilde_pre_f32.data_ptr<float>(),
+        d_tilde_post_f32.data_ptr<float>(), p_concat_f32.data_ptr<float>(),
+        rms_inv_f32.data_ptr<float>(), alpha_pre, alpha_post, alpha_res, B, n, stream);
+
+    return {d_p_pre, d_p_post,      d_p_res_flat,   d_b_pre,       d_b_post,
+            d_b_res, d_alpha_pre_t, d_alpha_post_t, d_alpha_res_t, d_r};
+}
+
+void mhc_rms_correction(torch::Tensor d_x_flat, torch::Tensor d_r, torch::Tensor x_flat,
+                        torch::Tensor rms_inv, int nC) {
+    CHECK_INPUT(d_x_flat);
+    CHECK_INPUT(d_r);
+    CHECK_INPUT(x_flat);
+    CHECK_INPUT(rms_inv);
+
+    int B = d_r.size(0);
+    cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+    fused_rms_correction(d_x_flat.data_ptr<float>(), d_r.data_ptr<float>(),
+                         x_flat.data_ptr<float>(), rms_inv.data_ptr<float>(), B, nC, stream);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("sinkhorn_knopp_fwd", &sinkhorn_knopp_fwd);
     m.def("sinkhorn_knopp_bwd", &sinkhorn_knopp_bwd);
+    m.def("sinkhorn_knopp_bwd_batched", &sinkhorn_knopp_bwd_batched);
     m.def("rmsnorm_fwd", &rmsnorm_fwd);
     m.def("rmsnorm_bwd", &rmsnorm_bwd);
     m.def("mhc_layer_fwd", &mhc_layer_fwd);
@@ -764,4 +853,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("mhc_dynamic_aggregate_bwd", &mhc_dynamic_aggregate_bwd);
     m.def("mhc_dynamic_mix_fwd", &mhc_dynamic_mix_fwd);
     m.def("mhc_dynamic_mix_bwd", &mhc_dynamic_mix_bwd);
+    m.def("h_backward_pre", &mhc_h_backward_pre);
+    m.def("h_backward_post", &mhc_h_backward_post);
+    m.def("rms_correction", &mhc_rms_correction);
 }

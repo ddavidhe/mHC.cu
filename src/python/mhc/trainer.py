@@ -133,6 +133,10 @@ def _param_grad_gb(model: torch.nn.Module) -> tuple[float, float]:
     return _bytes_to_gib(param_bytes), _bytes_to_gib(grad_bytes)
 
 
+def _count_params(model: torch.nn.Module) -> int:
+    return sum(p.numel() for p in model.parameters())
+
+
 def _resolve_text_field(example: dict) -> str:
     for key in ("text", "content", "document", "doc", "data"):
         if key in example:
@@ -195,7 +199,11 @@ def _apply_scale(config: dict, scale: float) -> dict:
         return config
     hidden_dim = max(16, int(config["hidden_dim"] * scale))
     n_heads = max(1, int(config["n_heads"] * scale))
-    hidden_dim = max(n_heads, (hidden_dim // n_heads) * n_heads)
+    # Ensure head_dim is even (required by RoPE rotate_half)
+    head_dim = hidden_dim // n_heads
+    if head_dim % 2 != 0:
+        head_dim += 1
+    hidden_dim = n_heads * head_dim
     ffn_dim = max(16, int(config["ffn_dim"] * scale))
     config = dict(config)
     config.update(hidden_dim=hidden_dim, n_heads=n_heads, ffn_dim=ffn_dim)
@@ -226,7 +234,8 @@ def _build_model_config(args, vocab_size: int) -> ModelConfig:
         sdp_kernel=args.sdp_kernel,
         recompute_ratio=args.recompute_ratio,
         recompute_mhc=args.recompute_mhc,
-        use_dynamic_h=True,
+        use_dynamic_h=args.dynamic_h,
+        mlp_type=args.mlp_type,
     )
 
 
@@ -336,6 +345,10 @@ class MHCTrainer(Trainer):
             metadata={"format": "pt"},
         )
         torch.save(self.args, os.path.join(output_dir, TRAINING_ARGS_NAME))
+        if hasattr(self.model, "config"):
+            config_path = os.path.join(output_dir, "model_config.json")
+            with open(config_path, "w") as f:
+                json.dump(asdict(self.model.config), f, indent=2)
 
     def _resolve_inputs(
         self, inputs: dict[str, torch.Tensor]
@@ -425,6 +438,9 @@ def run_training(argv: Optional[list[str]] = None):
     parser.add_argument("--scale", type=float, default=1.0)
     parser.add_argument("--dataset", default="Trelis/tiny-shakespeare")
     parser.add_argument("--dataset-split", default="train")
+    parser.add_argument("--eval-dataset", default=None)
+    parser.add_argument("--eval-split", default="validation")
+    parser.add_argument("--eval-steps", type=int, default=0)
     parser.add_argument("--text-field", default=None)
     parser.add_argument("--tokenizer", default="deepseek-ai/DeepSeek-V3")
     parser.add_argument("--seq-len", type=int, default=None)
@@ -434,6 +450,12 @@ def run_training(argv: Optional[list[str]] = None):
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--warmup-steps", type=int, default=None)
     parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument(
+        "--lr-schedule",
+        choices=("cosine", "linear"),
+        default="cosine",
+        help="LR schedule after warmup. Default: cosine (matches paper).",
+    )
     parser.add_argument(
         "--lr-scale",
         choices=("none", "linear", "sqrt"),
@@ -470,6 +492,18 @@ def run_training(argv: Optional[list[str]] = None):
         action="store_true",
         help="Recompute residual-stream kernels in backward without rerunning attention/MLP.",
     )
+    parser.add_argument(
+        "--dynamic-h",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use dynamic (input-dependent) H matrices. Default: True (matches paper).",
+    )
+    parser.add_argument(
+        "--mlp-type",
+        choices=("swiglu", "gelu"),
+        default="swiglu",
+        help="MLP type. Default: swiglu (matches DeepSeek architecture).",
+    )
     parser.add_argument("--n-layers", type=int, default=None)
     parser.add_argument("--hidden-dim", type=int, default=None)
     parser.add_argument("--n-heads", type=int, default=None)
@@ -497,14 +531,14 @@ def run_training(argv: Optional[list[str]] = None):
         help="Compute LM head + loss in token chunks to reduce peak memory.",
     )
     parser.add_argument(
-        "--fused",
-        action="store_true",
-        help="Enable fused mHC kernels (experimental).",
-    )
-    parser.add_argument(
         "--no-fused",
         action="store_true",
-        help="Disable fused mHC kernels.",
+        help="Disable fused mHC CUDA kernels (uses pure PyTorch path).",
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action="store_true",
+        help="Apply torch.compile(mode='reduce-overhead') for CUDA graph optimization.",
     )
     parser.add_argument("--runs-root", default=os.getenv("MHC_RUNS_ROOT", "runs"))
     parser.add_argument("--run-name", default=None)
@@ -536,9 +570,7 @@ def run_training(argv: Optional[list[str]] = None):
         base_lr *= lr_scale_factor
 
     warmup_steps = args.warmup_steps or min(2000, args.max_steps)
-    if args.fused and args.no_fused:
-        raise ValueError("Use at most one of --fused or --no-fused.")
-    use_fused_mhc = args.fused and not args.no_fused
+    use_fused_mhc = not args.no_fused
     if use_fused_mhc and mhc_cuda is None:
         print("mhc_cuda not found; falling back to python mHC path.")
         use_fused_mhc = False
@@ -572,6 +604,12 @@ def run_training(argv: Optional[list[str]] = None):
     if args.dtype == "bf16":
         model = model.to(dtype=torch.bfloat16)
 
+    if args.torch_compile:
+        model = torch.compile(model, mode="max-autotune", dynamic=False)
+
+    n_params = _count_params(model)
+    print(f"model params: {n_params:,} ({n_params / 1e6:.1f}M)")
+
     seq_len = model_config.max_seq_len
     stride = args.stride or seq_len
     dataset = _prepare_hf_dataset(dataset, tokenizer, text_field, seq_len, stride)
@@ -582,6 +620,19 @@ def run_training(argv: Optional[list[str]] = None):
         else:
             dataset = dataset.shuffle(seed=args.seed)
     dataset = dataset.with_format("torch")
+
+    eval_dataset = None
+    if args.eval_dataset or args.eval_steps > 0:
+        eval_source = args.eval_dataset or args.dataset
+        eval_ds = load_dataset(
+            eval_source,
+            split=args.eval_split,
+            streaming=args.streaming,
+            token=args.hf_token,
+        )
+        eval_ds = _prepare_hf_dataset(eval_ds, tokenizer, text_field, seq_len, stride)
+        eval_ds = eval_ds.filter(_nonempty_example)
+        eval_dataset = eval_ds.with_format("torch")
 
     run_name = args.run_name or f"mhc-{args.preset}-{int(time.time())}"
     out_dir = Path(args.runs_root) / run_name
@@ -594,6 +645,7 @@ def run_training(argv: Optional[list[str]] = None):
                 "preset_batch_size": preset_train["batch_size"],
                 "preset_training_steps": preset_train["training_steps"],
                 "base_lr": base_lr,
+                "lr_schedule": args.lr_schedule,
                 "lr_scale": args.lr_scale,
                 "lr_scale_factor": lr_scale_factor,
                 "warmup_steps": warmup_steps,
@@ -601,6 +653,7 @@ def run_training(argv: Optional[list[str]] = None):
                 "tokenizer": args.tokenizer,
                 "text_field": text_field,
                 "model_config": asdict(model_config),
+                "n_params": n_params,
                 "batch_size": args.batch_size,
                 "grad_accum": args.grad_accum,
                 "effective_batch_size": effective_batch,
@@ -616,17 +669,27 @@ def run_training(argv: Optional[list[str]] = None):
             indent=2,
         )
 
+    with (out_dir / "model_config.json").open("w") as f:
+        json.dump(asdict(model_config), f, indent=2)
+
     if args.log_memory and torch.cuda.is_available():
         param_gb, _ = _param_grad_gb(model)
         print(f"model_params={param_gb:.2f}G (bf16 storage)")
 
-    training_args = TrainingArguments(
+    eval_strategy = "no"
+    eval_steps_val = None
+    if eval_dataset is not None and args.eval_steps > 0:
+        eval_strategy = "steps"
+        eval_steps_val = args.eval_steps
+
+    ta_kwargs = dict(
         output_dir=str(out_dir),
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
         max_steps=args.max_steps,
         warmup_steps=warmup_steps,
         learning_rate=base_lr,
+        lr_scheduler_type=args.lr_schedule,
         weight_decay=args.weight_decay,
         adam_beta1=args.beta1,
         adam_beta2=args.beta2,
@@ -643,8 +706,21 @@ def run_training(argv: Optional[list[str]] = None):
         dataloader_pin_memory=torch.cuda.is_available(),
         run_name=run_name,
         remove_unused_columns=False,
-        save_safetensors=True,
     )
+    import inspect
+
+    _ta_params = inspect.signature(TrainingArguments).parameters
+    # eval_strategy was renamed from evaluation_strategy in newer transformers
+    if eval_strategy != "no":
+        if "eval_strategy" in _ta_params:
+            ta_kwargs["eval_strategy"] = eval_strategy
+        else:
+            ta_kwargs["evaluation_strategy"] = eval_strategy
+        ta_kwargs["eval_steps"] = eval_steps_val
+    # save_safetensors added in transformers >= 4.36
+    if "save_safetensors" in _ta_params:
+        ta_kwargs["save_safetensors"] = True
+    training_args = TrainingArguments(**ta_kwargs)
 
     tokens_per_step = args.batch_size * args.grad_accum * seq_len
     metrics_path = out_dir / "metrics.jsonl"
@@ -653,6 +729,7 @@ def run_training(argv: Optional[list[str]] = None):
         model=model,
         args=training_args,
         train_dataset=dataset,
+        eval_dataset=eval_dataset,
         data_collator=default_data_collator,
         logits_chunk_size=args.logits_chunk_size,
         loss_dtype=args.loss_dtype,

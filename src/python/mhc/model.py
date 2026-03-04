@@ -41,6 +41,7 @@ class ModelConfig:
     recompute_mhc: bool = False
     use_dynamic_h: bool = True
     use_fused_mhc: bool = True
+    mlp_type: str = "swiglu"
 
 
 H_RES_EXP_CLAMP = 20.0
@@ -157,7 +158,7 @@ class DynamicHFusedFunction(Function):
         b_pre_f32 = b_pre.float().contiguous()
         b_post_f32 = b_post.float().contiguous()
         b_res_f32 = b_res.float().contiguous()
-        H_pre_activated, H_post_activated, M = mhc_cuda.mhc_dynamic_h_fwd(
+        H_pre_activated, H_post_activated, M, rms_h = mhc_cuda.mhc_dynamic_h_fwd(
             x_expanded.contiguous(),
             phi_concat,
             alpha_pre_val,
@@ -180,10 +181,13 @@ class DynamicHFusedFunction(Function):
             H_pre_activated,
             H_post_activated,
             M,
-            alpha_pre,
-            alpha_post,
-            alpha_res,
+            rms_h,
         )
+        # Cache scalar float values to avoid .item() sync in backward
+        ctx.alpha_pre_val = alpha_pre_val
+        ctx.alpha_post_val = alpha_post_val
+        ctx.alpha_res_val = alpha_res_val
+        ctx.alpha_dtype = alpha_pre.dtype
         ctx.sinkhorn_iters = sinkhorn_iters
         ctx.eps = eps
         return H_pre_activated, H_post_activated, M
@@ -201,91 +205,104 @@ class DynamicHFusedFunction(Function):
             H_pre_activated,
             H_post_activated,
             M,
-            alpha_pre,
-            alpha_post,
-            alpha_res,
+            rms_h,
         ) = ctx.saved_tensors
+
+        # Use cached float values — no .item() sync needed
+        alpha_pre_val = ctx.alpha_pre_val
+        alpha_post_val = ctx.alpha_post_val
+        alpha_res_val = ctx.alpha_res_val
 
         B, n, C = x_expanded.shape
         nC = n * C
         x_flat = x_expanded.reshape(B, nC).float()
-        rms_h = x_flat.pow(2).mean(dim=-1, keepdim=True).add(ctx.eps).sqrt()
-        rms_inv = 1.0 / rms_h
-        rms_inv2 = rms_inv * rms_inv
+        rms_inv = (1.0 / rms_h).contiguous()
 
         phi_pre_f32 = phi_pre.float()
         phi_post_f32 = phi_post.float()
         phi_res_f32 = phi_res.float()
 
-        p_pre = x_flat @ phi_pre_f32.t()
-        p_post = x_flat @ phi_post_f32.t()
-        p_res_flat = x_flat @ phi_res_f32.t()
-        p_res = p_res_flat.view(B, n, n)
-
-        H_pre_act = H_pre_activated.float()
-        H_post_act = H_post_activated.float()
-
-        d_tilde_pre = d_H_pre * H_pre_act * (1.0 - H_pre_act)
-        d_tilde_post = d_H_post * H_post_act * (1.0 - H_post_act / 2.0)
-
-        alpha_pre_f32 = alpha_pre.float()
-        alpha_post_f32 = alpha_post.float()
-        alpha_res_f32 = alpha_res.float()
-        b_res_f32 = b_res.float()
-
-        tilde_res = alpha_res_f32 * p_res * rms_inv.view(B, 1, 1) + b_res_f32
-        tilde_res = torch.clamp(tilde_res, max=H_RES_EXP_CLAMP)
-        H_res_exp = torch.exp(tilde_res)
-
-        d_H_res_exp = torch.empty_like(H_res_exp)
-        for b in range(B):
-            d_H_res_exp[b] = mhc_cuda.sinkhorn_knopp_bwd(
-                d_M[b].contiguous(),
-                M[b].contiguous(),
-                H_res_exp[b].contiguous(),
-                ctx.sinkhorn_iters,
-                ctx.eps,
-            )
-        d_tilde_res = d_H_res_exp * H_res_exp
-
-        d_b_pre = d_tilde_pre.sum(dim=0)
-        d_b_post = d_tilde_post.sum(dim=0)
-        d_b_res = d_tilde_res.sum(dim=0)
-
-        d_alpha_pre = (d_tilde_pre * (p_pre * rms_inv)).sum()
-        d_alpha_post = (d_tilde_post * (p_post * rms_inv)).sum()
-        d_alpha_res = (d_tilde_res * (p_res * rms_inv.view(B, 1, 1))).sum()
-
-        d_p_pre = d_tilde_pre * (alpha_pre_f32 * rms_inv)
-        d_p_post = d_tilde_post * (alpha_post_f32 * rms_inv)
-        d_p_res = d_tilde_res * (alpha_res_f32 * rms_inv.view(B, 1, 1))
-        d_p_res_flat = d_p_res.reshape(B, n * n)
-
-        d_phi_pre = d_p_pre.t() @ x_flat
-        d_phi_post = d_p_post.t() @ x_flat
-        d_phi_res = d_p_res_flat.t() @ x_flat
-
-        d_x_flat = d_p_pre @ phi_pre_f32
-        d_x_flat += d_p_post @ phi_post_f32
-        d_x_flat += d_p_res_flat @ phi_res_f32
-
-        d_r = -(d_tilde_pre * (alpha_pre_f32 * p_pre) * rms_inv2).sum(dim=1)
-        d_r -= (d_tilde_post * (alpha_post_f32 * p_post) * rms_inv2).sum(dim=1)
-        d_r -= (d_tilde_res * (alpha_res_f32 * p_res) * rms_inv2.view(B, 1, 1)).sum(
-            dim=(1, 2)
+        # Fused projection: single GEMM instead of 3
+        phi_concat_f32 = torch.cat(
+            [phi_pre_f32, phi_post_f32, phi_res_f32.view(n * n, nC)], dim=0
         )
-        d_x_flat += d_r[:, None] * x_flat * (rms_inv / float(nC))
+        p_concat = x_flat @ phi_concat_f32.t()
+
+        # Fused pre-sinkhorn kernel: sigmoid derivatives + H_res_exp recomputation
+        d_tilde_pre, d_tilde_post, H_res_exp = mhc_cuda.h_backward_pre(
+            d_H_pre.contiguous(),
+            d_H_post.contiguous(),
+            H_pre_activated.contiguous(),
+            H_post_activated.contiguous(),
+            p_concat.contiguous(),
+            rms_inv,
+            alpha_res_val,
+            b_res.float().contiguous(),
+            n,
+        )
+
+        # Sinkhorn backward (unchanged)
+        d_H_res_exp = mhc_cuda.sinkhorn_knopp_bwd_batched(
+            d_M.contiguous(),
+            H_res_exp.contiguous(),
+            ctx.sinkhorn_iters,
+            ctx.eps,
+        )
+
+        # Fused post-sinkhorn kernel: all parameter grads + d_p + d_r
+        (
+            d_p_pre,
+            d_p_post,
+            d_p_res_flat,
+            d_b_pre,
+            d_b_post,
+            d_b_res,
+            d_alpha_pre,
+            d_alpha_post,
+            d_alpha_res,
+            d_r,
+        ) = mhc_cuda.h_backward_post(
+            d_H_res_exp.contiguous(),
+            H_res_exp.contiguous(),
+            d_tilde_pre.contiguous(),
+            d_tilde_post.contiguous(),
+            p_concat.contiguous(),
+            rms_inv,
+            alpha_pre_val,
+            alpha_post_val,
+            alpha_res_val,
+            n,
+        )
+
+        # Fused weight gradient: single GEMM instead of 3
+        d_p_concat = torch.cat([d_p_pre, d_p_post, d_p_res_flat], dim=1)
+        d_phi_concat = d_p_concat.t() @ x_flat
+        d_phi_pre = d_phi_concat[:n]
+        d_phi_post = d_phi_concat[n : 2 * n]
+        d_phi_res = d_phi_concat[2 * n :]
+
+        # Fused input gradient: single GEMM instead of 3
+        d_x_flat = d_p_concat @ phi_concat_f32
+
+        # Fused RMS correction kernel
+        mhc_cuda.rms_correction(d_x_flat.contiguous(), d_r, x_flat, rms_inv, nC)
 
         d_x = d_x_flat.view(B, n, C).to(x_expanded.dtype)
 
+        # Squeeze scalar outputs from post-sinkhorn kernel
+        d_alpha_pre = d_alpha_pre.squeeze()
+        d_alpha_post = d_alpha_post.squeeze()
+        d_alpha_res = d_alpha_res.squeeze()
+
+        alpha_dtype = ctx.alpha_dtype
         return (
             d_x,
             d_phi_pre.to(phi_pre.dtype),
             d_phi_post.to(phi_post.dtype),
-            d_phi_res.to(phi_res.dtype),
-            d_alpha_pre.to(alpha_pre.dtype),
-            d_alpha_post.to(alpha_post.dtype),
-            d_alpha_res.to(alpha_res.dtype),
+            d_phi_res.view_as(phi_res).to(phi_res.dtype),
+            d_alpha_pre.to(alpha_dtype),
+            d_alpha_post.to(alpha_dtype),
+            d_alpha_res.to(alpha_dtype),
             d_b_pre.to(b_pre.dtype),
             d_b_post.to(b_post.dtype),
             d_b_res.to(b_res.dtype),
@@ -389,6 +406,8 @@ class CausalSelfAttention(nn.Module):
         self.n_heads = n_heads
         self.head_dim = dim // n_heads
         self.rope_dim = min(rope_dim, self.head_dim)
+        # RoPE rotate_half requires even dimension
+        self.rope_dim = self.rope_dim - (self.rope_dim % 2)
         self.rope = (
             RotaryEmbedding(self.rope_dim, rope_theta) if self.rope_dim > 0 else None
         )
@@ -448,6 +467,24 @@ class MLP(nn.Module):
         if self.dropout:
             x = F.dropout(x, p=self.dropout, training=self.training)
         x = self.fc2(x)
+        return x
+
+
+class SwiGLUMLP(nn.Module):
+    def __init__(self, dim: int, ffn_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.gate = nn.Linear(dim, ffn_dim, bias=False)
+        self.up = nn.Linear(dim, ffn_dim, bias=False)
+        self.down = nn.Linear(ffn_dim, dim, bias=False)
+        self.dropout = dropout
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        gate = F.silu(self.gate(x))
+        up = self.up(x)
+        x = gate * up
+        if self.dropout:
+            x = F.dropout(x, p=self.dropout, training=self.training)
+        x = self.down(x)
         return x
 
 
@@ -683,7 +720,10 @@ class MHCTransformerBlock(nn.Module):
             config.dropout,
             config.sdp_kernel,
         )
-        mlp = MLP(config.hidden_dim, config.ffn_dim, config.dropout)
+        if config.mlp_type == "swiglu":
+            mlp = SwiGLUMLP(config.hidden_dim, config.ffn_dim, config.dropout)
+        else:
+            mlp = MLP(config.hidden_dim, config.ffn_dim, config.dropout)
 
         self.attn_resid = MHCResidual(
             config.hidden_dim,
@@ -731,6 +771,34 @@ class MHCTransformer(nn.Module):
         self._checkpoint_indices = self._build_checkpoint_indices(
             len(self.blocks), self.recompute_ratio
         )
+        self._init_weights()
+
+    def _init_weights(self) -> None:
+        """Initialize weights following DeepSeek/LLaMA conventions."""
+        init_std = 0.02
+        depth_std = init_std / (2 * self.config.n_layers) ** 0.5
+
+        for module in self.modules():
+            if module is self:
+                continue
+            if isinstance(module, nn.Embedding):
+                nn.init.normal_(module.weight, mean=0.0, std=init_std)
+            elif isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=init_std)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
+        # Scale residual-path projections by 1/sqrt(2*n_layers) to
+        # prevent signal growth through the residual stream.
+        for block in self.blocks:
+            for resid in (block.attn_resid, block.mlp_resid):
+                layer_fn = resid.layer_fn
+                if isinstance(layer_fn, CausalSelfAttention):
+                    nn.init.normal_(layer_fn.proj.weight, mean=0.0, std=depth_std)
+                elif isinstance(layer_fn, SwiGLUMLP):
+                    nn.init.normal_(layer_fn.down.weight, mean=0.0, std=depth_std)
+                elif isinstance(layer_fn, MLP):
+                    nn.init.normal_(layer_fn.fc2.weight, mean=0.0, std=depth_std)
 
     @staticmethod
     def _build_checkpoint_indices(num_layers: int, ratio: float) -> set[int]:

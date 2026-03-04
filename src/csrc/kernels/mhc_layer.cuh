@@ -282,17 +282,20 @@ struct MHCLayerGradients {
 };
 
 template<int BLOCK_SIZE>
-__global__ void sigmoid_kernel(float* __restrict__ out, const float* __restrict__ inp, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sigmoid_kernel(float* __restrict__ out,
+                                                                const float* __restrict__ inp,
+                                                                int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         float x = inp[idx];
-        out[idx] = fast_sigmoid(-x);
+        out[idx] = fast_sigmoid(x);
     }
 }
 
 template<int BLOCK_SIZE>
-__global__ void sigmoid_scale_kernel(float* __restrict__ out, const float* __restrict__ inp,
-                                     float scale, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sigmoid_scale_kernel(float* __restrict__ out,
+                                                                      const float* __restrict__ inp,
+                                                                      float scale, int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         float x = inp[idx];
@@ -301,7 +304,9 @@ __global__ void sigmoid_scale_kernel(float* __restrict__ out, const float* __res
 }
 
 template<int BLOCK_SIZE>
-__global__ void exp_kernel(float* __restrict__ out, const float* __restrict__ inp, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void exp_kernel(float* __restrict__ out,
+                                                            const float* __restrict__ inp,
+                                                            int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         out[idx] = fast_exp(inp[idx]);
@@ -309,8 +314,11 @@ __global__ void exp_kernel(float* __restrict__ out, const float* __restrict__ in
 }
 
 template<int BLOCK_SIZE>
-__global__ void sigmoid_backward_kernel(float* __restrict__ d_inp, const float* __restrict__ d_out,
-                                        const float* __restrict__ activated, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE,
+                             2) void sigmoid_backward_kernel(float* __restrict__ d_inp,
+                                                             const float* __restrict__ d_out,
+                                                             const float* __restrict__ activated,
+                                                             int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         float s = activated[idx];
@@ -319,9 +327,9 @@ __global__ void sigmoid_backward_kernel(float* __restrict__ d_inp, const float* 
 }
 
 template<int BLOCK_SIZE>
-__global__ void
-sigmoid_scale_backward_kernel(float* __restrict__ d_inp, const float* __restrict__ d_out,
-                              const float* __restrict__ activated, float scale, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sigmoid_scale_backward_kernel(
+    float* __restrict__ d_inp, const float* __restrict__ d_out, const float* __restrict__ activated,
+    float scale, int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         float s = activated[idx] / scale;
@@ -330,8 +338,11 @@ sigmoid_scale_backward_kernel(float* __restrict__ d_inp, const float* __restrict
 }
 
 template<int BLOCK_SIZE>
-__global__ void exp_backward_kernel(float* __restrict__ d_inp, const float* __restrict__ d_out,
-                                    const float* __restrict__ exp_val, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE,
+                             2) void exp_backward_kernel(float* __restrict__ d_inp,
+                                                         const float* __restrict__ d_out,
+                                                         const float* __restrict__ exp_val,
+                                                         int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         d_inp[idx] = d_out[idx] * exp_val[idx];
@@ -369,7 +380,7 @@ inline void exp_backward(float* d_inp, const float* d_out, const float* exp_val,
 }
 
 template<int BLOCK_SIZE>
-__global__ void apply_dynamic_h_activations_kernel(
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void apply_dynamic_h_activations_kernel(
     float* __restrict__ H_pre_out, float* __restrict__ H_post_out, float* __restrict__ H_res_out,
     const float* __restrict__ H_proj_raw, const float* __restrict__ b_pre,
     const float* __restrict__ b_post, const float* __restrict__ b_res, float alpha_pre,

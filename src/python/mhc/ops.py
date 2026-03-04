@@ -313,15 +313,12 @@ class MHCLayerDynamicFunction(Function):
             tilde_res = torch.clamp(tilde_res, max=20.0)
             H_res_exp = torch.exp(tilde_res)
 
-            d_H_res_exp = torch.empty_like(H_res_exp)
-            for b in range(B):
-                d_H_res_exp[b] = mhc_cuda.sinkhorn_knopp_bwd(
-                    d_M[b].contiguous(),
-                    M[b].contiguous(),
-                    H_res_exp[b].contiguous(),
-                    ctx.sinkhorn_iters,
-                    ctx.eps,
-                )
+            d_H_res_exp = mhc_cuda.sinkhorn_knopp_bwd_batched(
+                d_M.contiguous(),
+                H_res_exp.contiguous(),
+                ctx.sinkhorn_iters,
+                ctx.eps,
+            )
             d_tilde_res = d_H_res_exp * H_res_exp
 
             d_b_pre = d_tilde_pre.sum(dim=0)
