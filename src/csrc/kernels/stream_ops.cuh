@@ -15,8 +15,10 @@ namespace mhc {
 constexpr int STREAM_MIX_TC_THRESHOLD = 32;
 
 template<int BLOCK_SIZE>
-__global__ void stream_add_kernel(float* __restrict__ out, const float* __restrict__ a,
-                                  const float* __restrict__ b, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_add_kernel(float* __restrict__ out,
+                                                                   const float* __restrict__ a,
+                                                                   const float* __restrict__ b,
+                                                                   int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         out[idx] = a[idx] + b[idx];
@@ -24,11 +26,9 @@ __global__ void stream_add_kernel(float* __restrict__ out, const float* __restri
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void stream_aggregate_bf16_fused_sigmoid_kernel(floatX* __restrict__ out,
-                                                           float* __restrict__ H_pre_activated,
-                                                           const float* __restrict__ inp,
-                                                           const float* __restrict__ H_pre_raw,
-                                                           int B, int n, int C) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_aggregate_bf16_fused_sigmoid_kernel(
+    float* __restrict__ out, float* __restrict__ H_pre_activated, const float* __restrict__ inp,
+    const float* __restrict__ H_pre_raw, int B, int n, int C) {
     __shared__ float s_H_pre[MAX_N];
     if (threadIdx.x < n) {
         float activated = fast_sigmoid(H_pre_raw[threadIdx.x]);
@@ -48,15 +48,13 @@ __global__ void stream_aggregate_bf16_fused_sigmoid_kernel(floatX* __restrict__ 
         if (i < n)
             sum += s_H_pre[i] * inp[b * n * C + i * C + c];
     }
-    out[idx] = (floatX)sum;
+    out[idx] = sum;
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void stream_aggregate_bf16_fused_sigmoid_vec4_kernel(floatX* __restrict__ out,
-                                                                float* __restrict__ H_pre_activated,
-                                                                const float* __restrict__ inp,
-                                                                const float* __restrict__ H_pre_raw,
-                                                                int B, int n, int C) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_aggregate_bf16_fused_sigmoid_vec4_kernel(
+    float* __restrict__ out, float* __restrict__ H_pre_activated, const float* __restrict__ inp,
+    const float* __restrict__ H_pre_raw, int B, int n, int C) {
     __shared__ float s_H_pre[MAX_N];
     if (threadIdx.x < n) {
         float activated = fast_sigmoid(H_pre_raw[threadIdx.x]);
@@ -87,13 +85,11 @@ __global__ void stream_aggregate_bf16_fused_sigmoid_vec4_kernel(floatX* __restri
             sum.w += h * v.w;
         }
     }
-    __nv_bfloat162* out2 = reinterpret_cast<__nv_bfloat162*>(&out[b * C + c]);
-    out2[0] = __floats2bfloat162_rn(sum.x, sum.y);
-    out2[1] = __floats2bfloat162_rn(sum.z, sum.w);
+    *reinterpret_cast<float4*>(&out[b * C + c]) = sum;
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void stream_distribute_from_bf16_fused_sigmoid_kernel(
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_distribute_from_bf16_fused_sigmoid_kernel(
     float* __restrict__ out, float* __restrict__ H_post_activated, const floatX* __restrict__ inp,
     const float* __restrict__ H_post_raw, int B, int n, int C) {
     __shared__ float s_H_post[MAX_N];
@@ -116,9 +112,9 @@ __global__ void stream_distribute_from_bf16_fused_sigmoid_kernel(
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void stream_distribute_mix_add_fused_kernel(
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_distribute_mix_add_fused_kernel(
     float* __restrict__ out, float* __restrict__ H_post_activated, const float* __restrict__ x_inp,
-    const floatX* __restrict__ y_norm, const float* __restrict__ H_post_raw,
+    const float* __restrict__ y_norm, const float* __restrict__ H_post_raw,
     const float* __restrict__ M, int B, int n, int C) {
     __shared__ float s_M[MAX_N * MAX_N];
     __shared__ float s_H_post[MAX_N];
@@ -147,13 +143,13 @@ __global__ void stream_distribute_mix_add_fused_kernel(
         if (j < n)
             mix_sum += s_M[i * n + j] * x_inp[b * n * C + j * C + c];
     }
-    out[idx] = mix_sum + s_H_post[i] * (float)y_norm[b * C + c];
+    out[idx] = mix_sum + s_H_post[i] * y_norm[b * C + c];
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void stream_distribute_mix_add_fused_vec4_kernel(
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_distribute_mix_add_fused_vec4_kernel(
     float* __restrict__ out, float* __restrict__ H_post_activated, const float* __restrict__ x_inp,
-    const floatX* __restrict__ y_norm, const float* __restrict__ H_post_raw,
+    const float* __restrict__ y_norm, const float* __restrict__ H_post_raw,
     const float* __restrict__ M, int B, int n, int C) {
     __shared__ float s_M[MAX_N * MAX_N];
     __shared__ float s_H_post[MAX_N];
@@ -202,25 +198,22 @@ __global__ void stream_distribute_mix_add_fused_vec4_kernel(
         }
     }
 
-    const float4* y_vec = reinterpret_cast<const float4*>(
-        reinterpret_cast<const __nv_bfloat16*>(y_norm) + b * C + c_base);
-    __nv_bfloat16 y_bf16[4];
-    *reinterpret_cast<float2*>(y_bf16) = *reinterpret_cast<const float2*>(y_vec);
+    float4 yv = *reinterpret_cast<const float4*>(&y_norm[b * C + c_base]);
     float h_i = s_H_post[i];
-    result.x += h_i * __bfloat162float(y_bf16[0]);
-    result.y += h_i * __bfloat162float(y_bf16[1]);
-    result.z += h_i * __bfloat162float(y_bf16[2]);
-    result.w += h_i * __bfloat162float(y_bf16[3]);
+    result.x += h_i * yv.x;
+    result.y += h_i * yv.y;
+    result.z += h_i * yv.z;
+    result.w += h_i * yv.w;
 
     float4* out_vec = reinterpret_cast<float4*>(out + b * n * C + i * C + c_base);
     *out_vec = result;
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void
-distribute_add_fused_kernel(float* __restrict__ out, float* __restrict__ H_post_activated,
-                            const float* __restrict__ mix_out, const floatX* __restrict__ y_norm,
-                            const float* __restrict__ H_post_raw, int B, int n, int C) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void distribute_add_fused_kernel(
+    float* __restrict__ out, float* __restrict__ H_post_activated,
+    const float* __restrict__ mix_out, const float* __restrict__ y_norm,
+    const float* __restrict__ H_post_raw, int B, int n, int C) {
     __shared__ float s_H_post[MAX_N];
     if (threadIdx.x < n) {
         float activated = 2.0f * fast_sigmoid(H_post_raw[threadIdx.x]);
@@ -239,7 +232,7 @@ distribute_add_fused_kernel(float* __restrict__ out, float* __restrict__ H_post_
     int c = remainder % C;
 
     float mix_val = mix_out[idx];
-    float dist_val = s_H_post[i] * (float)y_norm[b * C + c];
+    float dist_val = s_H_post[i] * y_norm[b * C + c];
     out[idx] = mix_val + dist_val;
 }
 
@@ -314,7 +307,7 @@ class StreamMixTC {
     }
 
     void forward_fused_distribute_add(float* out, float* H_post_activated, const float* inp,
-                                      const floatX* y_norm, const float* M, const float* H_post_raw,
+                                      const float* y_norm, const float* M, const float* H_post_raw,
                                       float* mix_out, cudaStream_t stream = nullptr) {
         float alpha = 1.0f, beta = 0.0f;
         cublasLtMatmul(handle, matmulDesc, &alpha, inp, Xdesc, M, Mdesc, &beta, mix_out, Ydesc,
@@ -329,7 +322,7 @@ class StreamMixTC {
     }
 };
 
-inline void stream_aggregate_bf16_fused_sigmoid(floatX* out, float* H_pre_activated,
+inline void stream_aggregate_bf16_fused_sigmoid(float* out, float* H_pre_activated,
                                                 const float* inp, const float* H_pre_raw, int B,
                                                 int n, int C, cudaStream_t stream = nullptr) {
     constexpr int BLOCK = 256;
@@ -407,7 +400,7 @@ inline void stream_aggregate_bf16_fused_sigmoid(floatX* out, float* H_pre_activa
 }
 
 inline void stream_distribute_mix_add_fused(float* out, float* H_post_activated, const float* x_inp,
-                                            const floatX* y_norm, const float* H_post_raw,
+                                            const float* y_norm, const float* H_post_raw,
                                             const float* M, int B, int n, int C,
                                             cudaStream_t stream = nullptr) {
     constexpr int BLOCK = 256;
@@ -449,9 +442,9 @@ inline void stream_distribute_mix_add_fused(float* out, float* H_post_activated,
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void
-stream_aggregate_bf16_dynamic_kernel(floatX* __restrict__ out, const float* __restrict__ inp,
-                                     const float* __restrict__ H_pre, int B, int n, int C) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_aggregate_bf16_dynamic_kernel(
+    float* __restrict__ out, const float* __restrict__ inp, const float* __restrict__ H_pre, int B,
+    int n, int C) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx >= B * C)
         return;
@@ -465,13 +458,13 @@ stream_aggregate_bf16_dynamic_kernel(floatX* __restrict__ out, const float* __re
         if (i < n)
             sum += h[i] * inp[b * n * C + i * C + c];
     }
-    out[idx] = (floatX)sum;
+    out[idx] = sum;
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void
-stream_aggregate_bf16_dynamic_vec4_kernel(floatX* __restrict__ out, const float* __restrict__ inp,
-                                          const float* __restrict__ H_pre, int B, int n, int C) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_aggregate_bf16_dynamic_vec4_kernel(
+    float* __restrict__ out, const float* __restrict__ inp, const float* __restrict__ H_pre, int B,
+    int n, int C) {
     int idx4 = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     int C4 = C / 4;
     if (idx4 >= B * C4)
@@ -495,14 +488,12 @@ stream_aggregate_bf16_dynamic_vec4_kernel(floatX* __restrict__ out, const float*
             sum.w += hi * v.w;
         }
     }
-    __nv_bfloat162* out2 = reinterpret_cast<__nv_bfloat162*>(&out[b * C + c]);
-    out2[0] = __floats2bfloat162_rn(sum.x, sum.y);
-    out2[1] = __floats2bfloat162_rn(sum.z, sum.w);
+    *reinterpret_cast<float4*>(&out[b * C + c]) = sum;
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void stream_distribute_mix_add_dynamic_kernel(
-    float* __restrict__ out, const float* __restrict__ x_inp, const floatX* __restrict__ y_norm,
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_distribute_mix_add_dynamic_kernel(
+    float* __restrict__ out, const float* __restrict__ x_inp, const float* __restrict__ y_norm,
     const float* __restrict__ H_post, const float* __restrict__ M, int B, int n, int C) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx >= B * n * C)
@@ -522,10 +513,49 @@ __global__ void stream_distribute_mix_add_dynamic_kernel(
         if (j < n)
             mix_sum += m[i * n + j] * x_inp[b * n * C + j * C + c];
     }
-    out[idx] = mix_sum + h[i] * (float)y_norm[b * C + c];
+    out[idx] = mix_sum + h[i] * y_norm[b * C + c];
 }
 
-inline void stream_aggregate_bf16_dynamic(floatX* out, const float* inp, const float* H_pre, int B,
+template<int BLOCK_SIZE, int MAX_N>
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_distribute_mix_add_dynamic_vec4_kernel(
+    float* __restrict__ out, const float* __restrict__ x_inp, const float* __restrict__ y_norm,
+    const float* __restrict__ H_post, const float* __restrict__ M, int B, int n, int C) {
+    int C4 = C / 4;
+    int vec_idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    if (vec_idx >= B * n * C4)
+        return;
+
+    int b = vec_idx / (n * C4);
+    int remainder = vec_idx % (n * C4);
+    int i = remainder / C4;
+    int c_base = (remainder % C4) * 4;
+
+    const float* m = M + b * n * n;
+    float4 mix_sum = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#pragma unroll
+    for (int j = 0; j < MAX_N; j++) {
+        if (j < n) {
+            float4 xv = *reinterpret_cast<const float4*>(x_inp + b * n * C + j * C + c_base);
+            float m_ij = m[i * n + j];
+            mix_sum.x += m_ij * xv.x;
+            mix_sum.y += m_ij * xv.y;
+            mix_sum.z += m_ij * xv.z;
+            mix_sum.w += m_ij * xv.w;
+        }
+    }
+
+    float4 yv = *reinterpret_cast<const float4*>(&y_norm[b * C + c_base]);
+    float h = H_post[b * n + i];
+
+    float4 result;
+    result.x = mix_sum.x + h * yv.x;
+    result.y = mix_sum.y + h * yv.y;
+    result.z = mix_sum.z + h * yv.z;
+    result.w = mix_sum.w + h * yv.w;
+    *reinterpret_cast<float4*>(out + b * n * C + i * C + c_base) = result;
+}
+
+inline void stream_aggregate_bf16_dynamic(float* out, const float* inp, const float* H_pre, int B,
                                           int n, int C, cudaStream_t stream = nullptr) {
     constexpr int BLOCK = 256;
     bool use_vec4 = (C % 4 == 0) && (C >= 64);
@@ -599,12 +629,81 @@ inline void stream_aggregate_bf16_dynamic(floatX* out, const float* inp, const f
     }
 }
 
-inline void stream_distribute_mix_add_fused_dynamic(float* out, const float* x_inp,
-                                                    const floatX* y_norm, const float* H_post,
-                                                    const float* M, int B, int n, int C,
-                                                    cudaStream_t stream = nullptr) {
-    constexpr int BLOCK = 256;
-    int blocks = (B * n * C + BLOCK - 1) / BLOCK;
+template<int BLOCK_SIZE, int MAX_N>
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void fused_aggregate_rmsnorm_dynamic_kernel(
+    float* __restrict__ y_norm_out, float* __restrict__ x_agg_out, float* __restrict__ rms_out,
+    const float* __restrict__ inp, const float* __restrict__ H_pre,
+    const floatX* __restrict__ weight, int B, int n, int C, float eps) {
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    int b = blockIdx.x;
+    if (b >= B)
+        return;
+
+    extern __shared__ float shared[];
+    float* s_reduce = shared;
+    float s_H[MAX_N];
+#pragma unroll
+    for (int i = 0; i < MAX_N; i++) {
+        if (i < n)
+            s_H[i] = H_pre[b * n + i];
+    }
+
+    float thread_sum_sq = 0.0f;
+    for (int c = threadIdx.x; c < C; c += BLOCK_SIZE) {
+        float agg = 0.0f;
+#pragma unroll
+        for (int i = 0; i < MAX_N; i++) {
+            if (i < n)
+                agg += s_H[i] * inp[b * n * C + i * C + c];
+        }
+        thread_sum_sq += agg * agg;
+    }
+
+    float warp_sum = cg::reduce(warp, thread_sum_sq, cg::plus<float>());
+    int warp_id = threadIdx.x / 32;
+    int lane_id = threadIdx.x % 32;
+    int num_warps = BLOCK_SIZE / 32;
+
+    if (lane_id == 0)
+        s_reduce[warp_id] = warp_sum;
+    __syncthreads();
+
+    if (warp_id == 0) {
+        float val = (lane_id < num_warps) ? s_reduce[lane_id] : 0.0f;
+        float block_sum = cg::reduce(warp, val, cg::plus<float>());
+        if (lane_id == 0) {
+            float rms = sqrtf(block_sum / (float)C + eps);
+            float rms_inv = 1.0f / rms;
+            s_reduce[0] = rms_inv;
+            rms_out[b] = rms;
+        }
+    }
+    __syncthreads();
+
+    float rms_inv = s_reduce[0];
+
+    for (int c = threadIdx.x; c < C; c += BLOCK_SIZE) {
+        float agg = 0.0f;
+#pragma unroll
+        for (int i = 0; i < MAX_N; i++) {
+            if (i < n)
+                agg += s_H[i] * inp[b * n * C + i * C + c];
+        }
+        float w = (float)weight[c];
+        y_norm_out[b * C + c] = agg * rms_inv * w;
+        x_agg_out[b * C + c] = agg;
+    }
+}
+
+inline void fused_aggregate_rmsnorm_dynamic(float* y_norm_out, float* x_agg_out, float* rms_out,
+                                            const float* inp, const float* H_pre,
+                                            const floatX* weight, int B, int n, int C, float eps,
+                                            cudaStream_t stream = nullptr) {
+    constexpr int BLOCK_SIZE = 512;
+    int num_warps = BLOCK_SIZE / 32;
+    size_t shared_mem = num_warps * sizeof(float);
 
 #ifdef MHC_ENABLE_PDL
     cudaLaunchAttribute attrs[1];
@@ -613,10 +712,92 @@ inline void stream_distribute_mix_add_fused_dynamic(float* out, const float* x_i
     cudaLaunchConfig_t config = {};
     config.numAttrs = 1;
     config.attrs = attrs;
-    config.blockDim = {BLOCK, 1, 1};
-    config.gridDim = {(unsigned int)blocks, 1, 1};
-    config.dynamicSmemBytes = 0;
+    config.blockDim = {BLOCK_SIZE, 1, 1};
+    config.gridDim = {(unsigned int)B, 1, 1};
+    config.dynamicSmemBytes = shared_mem;
     config.stream = stream;
+
+#define DISPATCH_FUSED_AGG_NORM(MAX_N_VAL)                                                         \
+    cudaLaunchKernelEx(&config, fused_aggregate_rmsnorm_dynamic_kernel<BLOCK_SIZE, MAX_N_VAL>,     \
+                       y_norm_out, x_agg_out, rms_out, inp, H_pre, weight, B, n, C, eps)
+#else
+#define DISPATCH_FUSED_AGG_NORM(MAX_N_VAL)                                                         \
+    fused_aggregate_rmsnorm_dynamic_kernel<BLOCK_SIZE, MAX_N_VAL>                                  \
+        <<<B, BLOCK_SIZE, shared_mem, stream>>>(y_norm_out, x_agg_out, rms_out, inp, H_pre,        \
+                                                weight, B, n, C, eps)
+#endif
+
+    if (n <= 4) {
+        DISPATCH_FUSED_AGG_NORM(4);
+    } else if (n <= 8) {
+        DISPATCH_FUSED_AGG_NORM(8);
+    } else if (n <= 16) {
+        DISPATCH_FUSED_AGG_NORM(16);
+    } else if (n <= 32) {
+        DISPATCH_FUSED_AGG_NORM(32);
+    } else {
+        fprintf(stderr, "fused_aggregate_rmsnorm_dynamic: n > 32 not implemented\n");
+    }
+#undef DISPATCH_FUSED_AGG_NORM
+}
+
+inline void stream_distribute_mix_add_fused_dynamic(float* out, const float* x_inp,
+                                                    const float* y_norm, const float* H_post,
+                                                    const float* M, int B, int n, int C,
+                                                    cudaStream_t stream = nullptr) {
+    constexpr int BLOCK = 256;
+    bool use_vec4 = (C % 4 == 0) && (C >= 64);
+
+    if (use_vec4) {
+        int blocks = (B * n * (C / 4) + BLOCK - 1) / BLOCK;
+
+#ifdef MHC_ENABLE_PDL
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t config = {};
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        config.blockDim = {BLOCK, 1, 1};
+        config.gridDim = {(unsigned int)blocks, 1, 1};
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+
+#define DISPATCH_MIX_ADD_DYN_VEC4(MAX_N_VAL)                                                       \
+    cudaLaunchKernelEx(&config, stream_distribute_mix_add_dynamic_vec4_kernel<BLOCK, MAX_N_VAL>,   \
+                       out, x_inp, y_norm, H_post, M, B, n, C)
+#else
+#define DISPATCH_MIX_ADD_DYN_VEC4(MAX_N_VAL)                                                       \
+    stream_distribute_mix_add_dynamic_vec4_kernel<BLOCK, MAX_N_VAL>                                \
+        <<<blocks, BLOCK, 0, stream>>>(out, x_inp, y_norm, H_post, M, B, n, C)
+#endif
+
+        if (n <= 4) {
+            DISPATCH_MIX_ADD_DYN_VEC4(4);
+        } else if (n <= 8) {
+            DISPATCH_MIX_ADD_DYN_VEC4(8);
+        } else if (n <= 16) {
+            DISPATCH_MIX_ADD_DYN_VEC4(16);
+        } else if (n <= 32) {
+            DISPATCH_MIX_ADD_DYN_VEC4(32);
+        } else {
+            fprintf(stderr, "stream_distribute_mix_add_fused_dynamic: n > 32 not implemented\n");
+        }
+#undef DISPATCH_MIX_ADD_DYN_VEC4
+    } else {
+        int blocks = (B * n * C + BLOCK - 1) / BLOCK;
+
+#ifdef MHC_ENABLE_PDL
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        cudaLaunchConfig_t config = {};
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        config.blockDim = {BLOCK, 1, 1};
+        config.gridDim = {(unsigned int)blocks, 1, 1};
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
 
 #define DISPATCH_MIX_ADD_DYN(MAX_N_VAL)                                                            \
     cudaLaunchKernelEx(&config, stream_distribute_mix_add_dynamic_kernel<BLOCK, MAX_N_VAL>, out,   \
@@ -627,24 +808,25 @@ inline void stream_distribute_mix_add_fused_dynamic(float* out, const float* x_i
         <<<blocks, BLOCK, 0, stream>>>(out, x_inp, y_norm, H_post, M, B, n, C)
 #endif
 
-    if (n <= 4) {
-        DISPATCH_MIX_ADD_DYN(4);
-    } else if (n <= 8) {
-        DISPATCH_MIX_ADD_DYN(8);
-    } else if (n <= 16) {
-        DISPATCH_MIX_ADD_DYN(16);
-    } else if (n <= 32) {
-        DISPATCH_MIX_ADD_DYN(32);
-    } else {
-        fprintf(stderr, "stream_distribute_mix_add_fused_dynamic: n > 32 not implemented\n");
-    }
+        if (n <= 4) {
+            DISPATCH_MIX_ADD_DYN(4);
+        } else if (n <= 8) {
+            DISPATCH_MIX_ADD_DYN(8);
+        } else if (n <= 16) {
+            DISPATCH_MIX_ADD_DYN(16);
+        } else if (n <= 32) {
+            DISPATCH_MIX_ADD_DYN(32);
+        } else {
+            fprintf(stderr, "stream_distribute_mix_add_fused_dynamic: n > 32 not implemented\n");
+        }
 #undef DISPATCH_MIX_ADD_DYN
+    }
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void
-stream_aggregate_backward_dx_kernel(float* __restrict__ d_inp, const float* __restrict__ grad,
-                                    const float* __restrict__ H_pre, int B, int n, int C) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_aggregate_backward_dx_kernel(
+    float* __restrict__ d_inp, const float* __restrict__ grad, const float* __restrict__ H_pre,
+    int B, int n, int C) {
     __shared__ float s_H_pre[MAX_N];
     if (threadIdx.x < n)
         s_H_pre[threadIdx.x] = H_pre[threadIdx.x];
@@ -662,10 +844,9 @@ stream_aggregate_backward_dx_kernel(float* __restrict__ d_inp, const float* __re
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void stream_aggregate_backward_dH_partial_kernel(float* __restrict__ partials,
-                                                            const float* __restrict__ grad,
-                                                            const float* __restrict__ inp, int B,
-                                                            int n, int C) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_aggregate_backward_dH_partial_kernel(
+    float* __restrict__ partials, const float* __restrict__ grad, const float* __restrict__ inp,
+    int B, int n, int C) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     __shared__ float s_warp_sums[MAX_N][BLOCK_SIZE / 32];
@@ -702,8 +883,9 @@ __global__ void stream_aggregate_backward_dH_partial_kernel(float* __restrict__ 
 }
 
 template<int MAX_N>
-__global__ void reduce_partials_kernel(float* __restrict__ out, const float* __restrict__ partials,
-                                       int n, int num_partials) {
+__global__ __launch_bounds__(256, 4) void reduce_partials_kernel(float* __restrict__ out,
+                                                                 const float* __restrict__ partials,
+                                                                 int n, int num_partials) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int i = blockIdx.x;
@@ -758,7 +940,7 @@ inline void stream_aggregate_backward(float* d_inp, float* d_H_pre, const float*
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void stream_distribute_mix_backward_dx_dy_kernel(
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_distribute_mix_backward_dx_dy_kernel(
     float* __restrict__ d_x, float* __restrict__ d_y_norm, const float* __restrict__ grad,
     const float* __restrict__ M, const float* __restrict__ H_post, int B, int n, int C) {
     __shared__ float s_M[MAX_N * MAX_N];
@@ -799,7 +981,7 @@ __global__ void stream_distribute_mix_backward_dx_dy_kernel(
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void stream_distribute_mix_backward_dx_dy_vec4_kernel(
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_distribute_mix_backward_dx_dy_vec4_kernel(
     float* __restrict__ d_x, float* __restrict__ d_y_norm, const float* __restrict__ grad,
     const float* __restrict__ M, const float* __restrict__ H_post, int B, int n, int C) {
     __shared__ float s_M[MAX_N * MAX_N];
@@ -849,7 +1031,7 @@ __global__ void stream_distribute_mix_backward_dx_dy_vec4_kernel(
 }
 
 template<int BLOCK_SIZE, int MAX_N>
-__global__ void stream_distribute_mix_backward_partials_kernel(
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_distribute_mix_backward_partials_kernel(
     float* __restrict__ partials_M, float* __restrict__ partials_H, const float* __restrict__ grad,
     const float* __restrict__ x, const float* __restrict__ y_norm, int B, int n, int C) {
     cg::thread_block block = cg::this_thread_block();
@@ -926,9 +1108,8 @@ __global__ void stream_distribute_mix_backward_partials_kernel(
 }
 
 template<int MAX_N>
-__global__ void reduce_partials_matrix_kernel(float* __restrict__ out,
-                                              const float* __restrict__ partials, int n,
-                                              int num_partials) {
+__global__ __launch_bounds__(256, 4) void reduce_partials_matrix_kernel(
+    float* __restrict__ out, const float* __restrict__ partials, int n, int num_partials) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
     int k = blockIdx.x;
@@ -994,6 +1175,309 @@ inline void stream_distribute_mix_backward_fused(float* d_x, float* d_y_norm, fl
         fprintf(stderr, "stream_distribute_mix_backward_fused: n > 32 not implemented\n");
     }
 #undef DISPATCH_DIST_BWD
+}
+
+template<int BLOCK_SIZE, int MAX_N, bool ACCUMULATE = false>
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void stream_aggregate_backward_dynamic_dx_kernel(
+    float* __restrict__ d_inp, const float* __restrict__ grad, const float* __restrict__ H_pre,
+    int B, int n, int C) {
+    int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    if (idx >= B * n * C)
+        return;
+
+    int b = idx / (n * C);
+    int remainder = idx % (n * C);
+    int i = remainder / C;
+    int c = remainder % C;
+    float val = grad[b * C + c] * H_pre[b * n + i];
+    if constexpr (ACCUMULATE)
+        d_inp[idx] += val;
+    else
+        d_inp[idx] = val;
+}
+
+template<int BLOCK_SIZE, int MAX_N>
+__global__ __launch_bounds__(BLOCK_SIZE, 4) void stream_aggregate_backward_dynamic_dH_kernel(
+    float* __restrict__ d_H_pre, const float* __restrict__ grad, const float* __restrict__ inp,
+    int B, int n, int C) {
+    // One warp (32 threads) per (b, i) element
+    // d_H_pre[b, i] = sum_c grad[b, c] * inp[b, i, c]
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    int warp_idx = (blockIdx.x * BLOCK_SIZE + threadIdx.x) / 32;
+    if (warp_idx >= B * n)
+        return;
+
+    int b = warp_idx / n;
+    int i = warp_idx % n;
+    int lane = warp.thread_rank();
+
+    const float* g_ptr = grad + b * C;
+    const float* x_ptr = inp + b * n * C + i * C;
+
+    float sum = 0.0f;
+    // Vectorized loads: each lane processes C/32 elements
+    int C4 = C / 4;
+    for (int c4 = lane; c4 < C4; c4 += 32) {
+        int c = c4 * 4;
+        float4 gv = *reinterpret_cast<const float4*>(g_ptr + c);
+        float4 xv = *reinterpret_cast<const float4*>(x_ptr + c);
+        sum += gv.x * xv.x + gv.y * xv.y + gv.z * xv.z + gv.w * xv.w;
+    }
+    // Handle remainder
+    for (int c = C4 * 4 + lane; c < C; c += 32)
+        sum += g_ptr[c] * x_ptr[c];
+
+    sum = cg::reduce(warp, sum, cg::plus<float>());
+    if (lane == 0)
+        d_H_pre[warp_idx] = sum;
+}
+
+template<bool ACCUMULATE = false>
+inline void stream_aggregate_backward_dynamic(float* d_inp, float* d_H_pre, const float* grad,
+                                              const float* inp, const float* H_pre, int B, int n,
+                                              int C, cudaStream_t stream = nullptr) {
+    constexpr int BLOCK = 256;
+    int blocks_dx = (B * n * C + BLOCK - 1) / BLOCK;
+    // dH kernel uses one warp (32 threads) per output element
+    int blocks_dH = (B * n * 32 + BLOCK - 1) / BLOCK;
+
+#define DISPATCH_AGG_BWD_DYN(MAX_N_VAL)                                                            \
+    stream_aggregate_backward_dynamic_dx_kernel<BLOCK, MAX_N_VAL, ACCUMULATE>                      \
+        <<<blocks_dx, BLOCK, 0, stream>>>(d_inp, grad, H_pre, B, n, C);                            \
+    stream_aggregate_backward_dynamic_dH_kernel<BLOCK, MAX_N_VAL>                                  \
+        <<<blocks_dH, BLOCK, 0, stream>>>(d_H_pre, grad, inp, B, n, C)
+
+    if (n <= 4) {
+        DISPATCH_AGG_BWD_DYN(4);
+    } else if (n <= 8) {
+        DISPATCH_AGG_BWD_DYN(8);
+    } else if (n <= 16) {
+        DISPATCH_AGG_BWD_DYN(16);
+    } else if (n <= 32) {
+        DISPATCH_AGG_BWD_DYN(32);
+    } else {
+        fprintf(stderr, "stream_aggregate_backward_dynamic: n > 32 not implemented\n");
+    }
+#undef DISPATCH_AGG_BWD_DYN
+}
+
+template<int BLOCK_SIZE, int MAX_N>
+__global__
+__launch_bounds__(BLOCK_SIZE, 2) void stream_distribute_mix_backward_dynamic_dx_dy_kernel(
+    float* __restrict__ d_x, float* __restrict__ d_y_norm, const float* __restrict__ grad,
+    const float* __restrict__ M, const float* __restrict__ H_post, int B, int n, int C) {
+    int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    if (idx >= B * n * C)
+        return;
+
+    int b = idx / (n * C);
+    int remainder = idx % (n * C);
+    int j = remainder / C;
+    int c = remainder % C;
+
+    const float* m_b = M + b * n * n;
+    float dx_sum = 0.0f;
+#pragma unroll
+    for (int i = 0; i < MAX_N; i++) {
+        if (i < n)
+            dx_sum += m_b[i * n + j] * grad[b * n * C + i * C + c];
+    }
+    d_x[idx] = dx_sum;
+
+    if (j == 0) {
+        const float* h_b = H_post + b * n;
+        float dy_sum = 0.0f;
+#pragma unroll
+        for (int i = 0; i < MAX_N; i++) {
+            if (i < n)
+                dy_sum += h_b[i] * grad[b * n * C + i * C + c];
+        }
+        d_y_norm[b * C + c] = dy_sum;
+    }
+}
+
+template<int BLOCK_SIZE, int MAX_N>
+__global__
+__launch_bounds__(BLOCK_SIZE, 2) void stream_distribute_mix_backward_dynamic_dx_dy_vec4_kernel(
+    float* __restrict__ d_x, float* __restrict__ d_y_norm, const float* __restrict__ grad,
+    const float* __restrict__ M, const float* __restrict__ H_post, int B, int n, int C) {
+    int C4 = C / 4;
+    int vec_idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    if (vec_idx >= B * n * C4)
+        return;
+
+    int b = vec_idx / (n * C4);
+    int remainder = vec_idx % (n * C4);
+    int j = remainder / C4;
+    int c_base = (remainder % C4) * 4;
+
+    const float* m_b = M + b * n * n;
+    const float* h_b = H_post + b * n;
+
+    float4 dx_acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    float4 dy_acc = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+
+#pragma unroll
+    for (int i = 0; i < MAX_N; i++) {
+        if (i < n) {
+            float4 g = *reinterpret_cast<const float4*>(grad + b * n * C + i * C + c_base);
+            float m_ij = m_b[i * n + j];
+            dx_acc.x += m_ij * g.x;
+            dx_acc.y += m_ij * g.y;
+            dx_acc.z += m_ij * g.z;
+            dx_acc.w += m_ij * g.w;
+            if (j == 0) {
+                float h_i = h_b[i];
+                dy_acc.x += h_i * g.x;
+                dy_acc.y += h_i * g.y;
+                dy_acc.z += h_i * g.z;
+                dy_acc.w += h_i * g.w;
+            }
+        }
+    }
+
+    *reinterpret_cast<float4*>(d_x + b * n * C + j * C + c_base) = dx_acc;
+    if (j == 0)
+        *reinterpret_cast<float4*>(d_y_norm + b * C + c_base) = dy_acc;
+}
+
+template<int BLOCK_SIZE, int MAX_N>
+__global__ __launch_bounds__(BLOCK_SIZE, 4) void stream_distribute_mix_backward_dynamic_dM_kernel(
+    float* __restrict__ d_M, const float* __restrict__ grad, const float* __restrict__ x, int B,
+    int n, int C) {
+    // One warp (32 threads) per (b, i, j) element
+    // d_M[b, i, j] = sum_c grad[b, i, c] * x[b, j, c]
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    int warp_idx = (blockIdx.x * BLOCK_SIZE + threadIdx.x) / 32;
+    if (warp_idx >= B * n * n)
+        return;
+
+    int b = warp_idx / (n * n);
+    int remainder = warp_idx % (n * n);
+    int i = remainder / n;
+    int j = remainder % n;
+    int lane = warp.thread_rank();
+
+    const float* g_ptr = grad + b * n * C + i * C;
+    const float* x_ptr = x + b * n * C + j * C;
+
+    float sum = 0.0f;
+    int C4 = C / 4;
+    for (int c4 = lane; c4 < C4; c4 += 32) {
+        int c = c4 * 4;
+        float4 gv = *reinterpret_cast<const float4*>(g_ptr + c);
+        float4 xv = *reinterpret_cast<const float4*>(x_ptr + c);
+        sum += gv.x * xv.x + gv.y * xv.y + gv.z * xv.z + gv.w * xv.w;
+    }
+    for (int c = C4 * 4 + lane; c < C; c += 32)
+        sum += g_ptr[c] * x_ptr[c];
+
+    sum = cg::reduce(warp, sum, cg::plus<float>());
+    if (lane == 0)
+        d_M[warp_idx] = sum;
+}
+
+template<int BLOCK_SIZE, int MAX_N>
+__global__ __launch_bounds__(BLOCK_SIZE, 4) void stream_distribute_mix_backward_dynamic_dH_kernel(
+    float* __restrict__ d_H_post, const float* __restrict__ grad, const float* __restrict__ y_norm,
+    int B, int n, int C) {
+    // One warp (32 threads) per (b, i) element
+    // d_H_post[b, i] = sum_c grad[b, i, c] * y_norm[b, c]
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+
+    int warp_idx = (blockIdx.x * BLOCK_SIZE + threadIdx.x) / 32;
+    if (warp_idx >= B * n)
+        return;
+
+    int b = warp_idx / n;
+    int i = warp_idx % n;
+    int lane = warp.thread_rank();
+
+    const float* g_ptr = grad + b * n * C + i * C;
+    const float* y_ptr = y_norm + b * C;
+
+    float sum = 0.0f;
+    int C4 = C / 4;
+    for (int c4 = lane; c4 < C4; c4 += 32) {
+        int c = c4 * 4;
+        float4 gv = *reinterpret_cast<const float4*>(g_ptr + c);
+        float4 yv = *reinterpret_cast<const float4*>(y_ptr + c);
+        sum += gv.x * yv.x + gv.y * yv.y + gv.z * yv.z + gv.w * yv.w;
+    }
+    for (int c = C4 * 4 + lane; c < C; c += 32)
+        sum += g_ptr[c] * y_ptr[c];
+
+    sum = cg::reduce(warp, sum, cg::plus<float>());
+    if (lane == 0)
+        d_H_post[warp_idx] = sum;
+}
+
+inline void stream_distribute_mix_backward_fused_dynamic(float* d_x, float* d_y_norm, float* d_M,
+                                                         float* d_H_post, const float* grad,
+                                                         const float* x, const float* y_norm,
+                                                         const float* M, const float* H_post, int B,
+                                                         int n, int C,
+                                                         cudaStream_t stream = nullptr) {
+    constexpr int BLOCK = 256;
+    // dM and dH kernels use one warp (32 threads) per output element
+    int blocks_dM = (B * n * n * 32 + BLOCK - 1) / BLOCK;
+    int blocks_dH = (B * n * 32 + BLOCK - 1) / BLOCK;
+    bool use_vec4 = (C % 4 == 0) && (C >= 64);
+
+    if (use_vec4) {
+        int blocks_dx = (B * n * (C / 4) + BLOCK - 1) / BLOCK;
+
+#define DISPATCH_DIST_BWD_DYN_VEC4(MAX_N_VAL)                                                      \
+    stream_distribute_mix_backward_dynamic_dx_dy_vec4_kernel<BLOCK, MAX_N_VAL>                     \
+        <<<blocks_dx, BLOCK, 0, stream>>>(d_x, d_y_norm, grad, M, H_post, B, n, C);                \
+    stream_distribute_mix_backward_dynamic_dM_kernel<BLOCK, MAX_N_VAL>                             \
+        <<<blocks_dM, BLOCK, 0, stream>>>(d_M, grad, x, B, n, C);                                  \
+    stream_distribute_mix_backward_dynamic_dH_kernel<BLOCK, MAX_N_VAL>                             \
+        <<<blocks_dH, BLOCK, 0, stream>>>(d_H_post, grad, y_norm, B, n, C)
+
+        if (n <= 4) {
+            DISPATCH_DIST_BWD_DYN_VEC4(4);
+        } else if (n <= 8) {
+            DISPATCH_DIST_BWD_DYN_VEC4(8);
+        } else if (n <= 16) {
+            DISPATCH_DIST_BWD_DYN_VEC4(16);
+        } else if (n <= 32) {
+            DISPATCH_DIST_BWD_DYN_VEC4(32);
+        } else {
+            fprintf(stderr,
+                    "stream_distribute_mix_backward_fused_dynamic: n > 32 not implemented\n");
+        }
+#undef DISPATCH_DIST_BWD_DYN_VEC4
+    } else {
+        int blocks_dx = (B * n * C + BLOCK - 1) / BLOCK;
+
+#define DISPATCH_DIST_BWD_DYN(MAX_N_VAL)                                                           \
+    stream_distribute_mix_backward_dynamic_dx_dy_kernel<BLOCK, MAX_N_VAL>                          \
+        <<<blocks_dx, BLOCK, 0, stream>>>(d_x, d_y_norm, grad, M, H_post, B, n, C);                \
+    stream_distribute_mix_backward_dynamic_dM_kernel<BLOCK, MAX_N_VAL>                             \
+        <<<blocks_dM, BLOCK, 0, stream>>>(d_M, grad, x, B, n, C);                                  \
+    stream_distribute_mix_backward_dynamic_dH_kernel<BLOCK, MAX_N_VAL>                             \
+        <<<blocks_dH, BLOCK, 0, stream>>>(d_H_post, grad, y_norm, B, n, C)
+
+        if (n <= 4) {
+            DISPATCH_DIST_BWD_DYN(4);
+        } else if (n <= 8) {
+            DISPATCH_DIST_BWD_DYN(8);
+        } else if (n <= 16) {
+            DISPATCH_DIST_BWD_DYN(16);
+        } else if (n <= 32) {
+            DISPATCH_DIST_BWD_DYN(32);
+        } else {
+            fprintf(stderr,
+                    "stream_distribute_mix_backward_fused_dynamic: n > 32 not implemented\n");
+        }
+#undef DISPATCH_DIST_BWD_DYN
+    }
 }
 
 } // namespace mhc

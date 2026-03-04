@@ -12,9 +12,9 @@ namespace cg = cooperative_groups;
 namespace mhc {
 
 template<int N_COMPILE, int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_warp_optimized_kernel(float* __restrict__ out,
-                                                     const float* __restrict__ inp, int M, int N,
-                                                     int num_iters, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sinkhorn_knopp_warp_optimized_kernel(
+    float* __restrict__ out, const float* __restrict__ inp, int M, int N, int num_iters,
+    float eps) {
     constexpr int WARPS_PER_BLOCK = BLOCK_SIZE / 32;
 
     extern __shared__ float smem[];
@@ -67,9 +67,8 @@ __global__ void sinkhorn_knopp_warp_optimized_kernel(float* __restrict__ out,
 }
 
 template<int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_warp_per_row_32x32_kernel(float* __restrict__ out,
-                                                         const float* __restrict__ inp,
-                                                         int num_iters, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sinkhorn_knopp_warp_per_row_32x32_kernel(
+    float* __restrict__ out, const float* __restrict__ inp, int num_iters, float eps) {
     constexpr int N = 32;
     constexpr int WARPS = BLOCK_SIZE / 32;
     constexpr int ROWS_PER_WARP = (N + WARPS - 1) / WARPS;
@@ -133,8 +132,10 @@ __global__ void sinkhorn_knopp_warp_per_row_32x32_kernel(float* __restrict__ out
 }
 
 template<int TILE_M, int TILE_N, int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_kernel(float* __restrict__ out, const float* __restrict__ inp, int M,
-                                      int N, int num_iters, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE,
+                             2) void sinkhorn_knopp_kernel(float* __restrict__ out,
+                                                           const float* __restrict__ inp, int M,
+                                                           int N, int num_iters, float eps) {
     extern __shared__ float smem[];
     float* tile = smem;
     float* row_sums = smem + TILE_M * TILE_N;
@@ -213,8 +214,10 @@ __global__ void sinkhorn_knopp_kernel(float* __restrict__ out, const float* __re
 }
 
 template<int TILE_M, int TILE_N, int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_pdl_kernel(float* __restrict__ out, const float* __restrict__ inp,
-                                          int M, int N, int num_iters, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE,
+                             2) void sinkhorn_knopp_pdl_kernel(float* __restrict__ out,
+                                                               const float* __restrict__ inp, int M,
+                                                               int N, int num_iters, float eps) {
     extern __shared__ float smem[];
     float* tile = smem;
     float* row_sums = smem + TILE_M * TILE_N;
@@ -299,9 +302,9 @@ __global__ void sinkhorn_knopp_pdl_kernel(float* __restrict__ out, const float* 
 }
 
 template<int MAX_DIM, int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_single_block_kernel(float* __restrict__ out,
-                                                   const float* __restrict__ inp, int M, int N,
-                                                   int num_iters, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sinkhorn_knopp_single_block_kernel(
+    float* __restrict__ out, const float* __restrict__ inp, int M, int N, int num_iters,
+    float eps) {
     extern __shared__ float smem[];
     float* tile = smem;
     float* row_sums = smem + MAX_DIM * MAX_DIM;
@@ -358,10 +361,9 @@ __global__ void sinkhorn_knopp_single_block_kernel(float* __restrict__ out,
 }
 
 template<int MAX_DIM, int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_single_block_fused_exp_kernel(float* __restrict__ out,
-                                                             float* __restrict__ H_res_exp,
-                                                             const float* __restrict__ inp, int M,
-                                                             int N, int num_iters, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sinkhorn_knopp_single_block_fused_exp_kernel(
+    float* __restrict__ out, float* __restrict__ H_res_exp, const float* __restrict__ inp, int M,
+    int N, int num_iters, float eps) {
     extern __shared__ float smem[];
     float* tile = smem;
     float* row_sums = smem + MAX_DIM * MAX_DIM;
@@ -519,9 +521,9 @@ inline void sinkhorn_knopp_forward_fused_exp(float* out, float* H_res_exp, const
 }
 
 template<int MAX_DIM, int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_single_block_pdl_kernel(float* __restrict__ out,
-                                                       const float* __restrict__ inp, int M, int N,
-                                                       int num_iters, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sinkhorn_knopp_single_block_pdl_kernel(
+    float* __restrict__ out, const float* __restrict__ inp, int M, int N, int num_iters,
+    float eps) {
     extern __shared__ float smem[];
     float* tile = smem;
     float* row_sums = smem + MAX_DIM * MAX_DIM;
@@ -584,10 +586,9 @@ __global__ void sinkhorn_knopp_single_block_pdl_kernel(float* __restrict__ out,
 }
 
 template<int N_COMPILE, int MAX_ITERS, int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_backward_checkpointed_kernel(float* __restrict__ d_inp,
-                                                            const float* __restrict__ grad,
-                                                            const float* __restrict__ M_inp, int N,
-                                                            int num_iters, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sinkhorn_knopp_backward_checkpointed_kernel(
+    float* __restrict__ d_inp, const float* __restrict__ grad, const float* __restrict__ M_inp,
+    int N, int num_iters, float eps) {
     extern __shared__ float smem[];
 
     float* checkpoints = smem;
@@ -690,10 +691,9 @@ __global__ void sinkhorn_knopp_backward_checkpointed_kernel(float* __restrict__ 
 }
 
 template<int MAX_DIM, int BLOCK_SIZE>
-__global__ void
-sinkhorn_knopp_backward_kernel(float* __restrict__ d_inp, const float* __restrict__ grad,
-                               const float* __restrict__ M_out, const float* __restrict__ M_inp,
-                               int N, int num_iters, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sinkhorn_knopp_backward_kernel(
+    float* __restrict__ d_inp, const float* __restrict__ grad, const float* __restrict__ M_out,
+    const float* __restrict__ M_inp, int N, int num_iters, float eps) {
     extern __shared__ float smem[];
     float* d_tile = smem;
     float* row_buffer = smem + MAX_DIM * MAX_DIM;
@@ -824,13 +824,183 @@ inline void sinkhorn_knopp_backward(float* d_inp, const float* grad, const float
     }
 }
 
+// Row-normalize a 4x4 matrix stored as 4 float4 rows
+__device__ __forceinline__ void sk4_row_normalize(float4& r0, float4& r1, float4& r2, float4& r3,
+                                                  float eps) {
+    float s0 = r0.x + r0.y + r0.z + r0.w;
+    float s1 = r1.x + r1.y + r1.z + r1.w;
+    float s2 = r2.x + r2.y + r2.z + r2.w;
+    float s3 = r3.x + r3.y + r3.z + r3.w;
+    float inv0 = (s0 > eps) ? __frcp_rn(s0) : 0.0f;
+    float inv1 = (s1 > eps) ? __frcp_rn(s1) : 0.0f;
+    float inv2 = (s2 > eps) ? __frcp_rn(s2) : 0.0f;
+    float inv3 = (s3 > eps) ? __frcp_rn(s3) : 0.0f;
+    r0.x *= inv0;
+    r0.y *= inv0;
+    r0.z *= inv0;
+    r0.w *= inv0;
+    r1.x *= inv1;
+    r1.y *= inv1;
+    r1.z *= inv1;
+    r1.w *= inv1;
+    r2.x *= inv2;
+    r2.y *= inv2;
+    r2.z *= inv2;
+    r2.w *= inv2;
+    r3.x *= inv3;
+    r3.y *= inv3;
+    r3.z *= inv3;
+    r3.w *= inv3;
+}
+
+// Column-normalize a 4x4 matrix stored as 4 float4 rows
+__device__ __forceinline__ void sk4_col_normalize(float4& r0, float4& r1, float4& r2, float4& r3,
+                                                  float eps) {
+    float c0 = r0.x + r1.x + r2.x + r3.x;
+    float c1 = r0.y + r1.y + r2.y + r3.y;
+    float c2 = r0.z + r1.z + r2.z + r3.z;
+    float c3 = r0.w + r1.w + r2.w + r3.w;
+    float cinv0 = (c0 > eps) ? __frcp_rn(c0) : 0.0f;
+    float cinv1 = (c1 > eps) ? __frcp_rn(c1) : 0.0f;
+    float cinv2 = (c2 > eps) ? __frcp_rn(c2) : 0.0f;
+    float cinv3 = (c3 > eps) ? __frcp_rn(c3) : 0.0f;
+    r0.x *= cinv0;
+    r0.y *= cinv1;
+    r0.z *= cinv2;
+    r0.w *= cinv3;
+    r1.x *= cinv0;
+    r1.y *= cinv1;
+    r1.z *= cinv2;
+    r1.w *= cinv3;
+    r2.x *= cinv0;
+    r2.y *= cinv1;
+    r2.z *= cinv2;
+    r2.w *= cinv3;
+    r3.x *= cinv0;
+    r3.y *= cinv1;
+    r3.z *= cinv2;
+    r3.w *= cinv3;
+}
+
+// Full Sinkhorn forward iteration (row-norm then col-norm)
+__device__ __forceinline__ void sk4_forward_step(float4& r0, float4& r1, float4& r2, float4& r3,
+                                                 float eps) {
+    sk4_row_normalize(r0, r1, r2, r3, eps);
+    sk4_col_normalize(r0, r1, r2, r3, eps);
+}
+
+// Sinkhorn backward step through column normalization
+// Given checkpoint w (after row-norm), updates d in-place
+__device__ __forceinline__ void sk4_col_backward(float4& d0, float4& d1, float4& d2, float4& d3,
+                                                 const float4& w0, const float4& w1,
+                                                 const float4& w2, const float4& w3) {
+    float col0 = d0.x * w0.x + d1.x * w1.x + d2.x * w2.x + d3.x * w3.x;
+    float col1 = d0.y * w0.y + d1.y * w1.y + d2.y * w2.y + d3.y * w3.y;
+    float col2 = d0.z * w0.z + d1.z * w1.z + d2.z * w2.z + d3.z * w3.z;
+    float col3 = d0.w * w0.w + d1.w * w1.w + d2.w * w2.w + d3.w * w3.w;
+    d0.x -= w0.x * col0;
+    d0.y -= w0.y * col1;
+    d0.z -= w0.z * col2;
+    d0.w -= w0.w * col3;
+    d1.x -= w1.x * col0;
+    d1.y -= w1.y * col1;
+    d1.z -= w1.z * col2;
+    d1.w -= w1.w * col3;
+    d2.x -= w2.x * col0;
+    d2.y -= w2.y * col1;
+    d2.z -= w2.z * col2;
+    d2.w -= w2.w * col3;
+    d3.x -= w3.x * col0;
+    d3.y -= w3.y * col1;
+    d3.z -= w3.z * col2;
+    d3.w -= w3.w * col3;
+}
+
+// Sinkhorn backward step through row normalization
+// Given checkpoint w (after row-norm), updates d in-place
+__device__ __forceinline__ void sk4_row_backward(float4& d0, float4& d1, float4& d2, float4& d3,
+                                                 const float4& w0, const float4& w1,
+                                                 const float4& w2, const float4& w3) {
+    float row0 = d0.x * w0.x + d0.y * w0.y + d0.z * w0.z + d0.w * w0.w;
+    float row1 = d1.x * w1.x + d1.y * w1.y + d1.z * w1.z + d1.w * w1.w;
+    float row2 = d2.x * w2.x + d2.y * w2.y + d2.z * w2.z + d2.w * w2.w;
+    float row3 = d3.x * w3.x + d3.y * w3.y + d3.z * w3.z + d3.w * w3.w;
+    d0.x -= w0.x * row0;
+    d0.y -= w0.y * row0;
+    d0.z -= w0.z * row0;
+    d0.w -= w0.w * row0;
+    d1.x -= w1.x * row1;
+    d1.y -= w1.y * row1;
+    d1.z -= w1.z * row1;
+    d1.w -= w1.w * row1;
+    d2.x -= w2.x * row2;
+    d2.y -= w2.y * row2;
+    d2.z -= w2.z * row2;
+    d2.w -= w2.w * row2;
+    d3.x -= w3.x * row3;
+    d3.y -= w3.y * row3;
+    d3.z -= w3.z * row3;
+    d3.w -= w3.w * row3;
+}
+
+// Batched Sinkhorn backward for n=4, fully in registers with forward recomputation
 template<int N_COMPILE>
-__global__ void sinkhorn_knopp_batched_n4_kernel(float* __restrict__ out,
-                                                 const float* __restrict__ inp, int B,
-                                                 int num_iters, float eps) {
+__global__ __launch_bounds__(256, 4) void sinkhorn_knopp_backward_batched_n4_kernel(
+    float* __restrict__ d_inp, const float* __restrict__ grad, const float* __restrict__ M_inp,
+    int B, int num_iters, float eps) {
+    static_assert(N_COMPILE == 4);
+
+    int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (batch_idx >= B)
+        return;
+
+    const float* inp_ptr = M_inp + batch_idx * 16;
+    const float* grad_ptr = grad + batch_idx * 16;
+
+    // Load original input (H_res_exp) — kept constant for recomputation
+    float4 inp0 = *reinterpret_cast<const float4*>(inp_ptr);
+    float4 inp1 = *reinterpret_cast<const float4*>(inp_ptr + 4);
+    float4 inp2 = *reinterpret_cast<const float4*>(inp_ptr + 8);
+    float4 inp3 = *reinterpret_cast<const float4*>(inp_ptr + 12);
+
+    // Load gradient
+    float4 d0 = *reinterpret_cast<const float4*>(grad_ptr);
+    float4 d1 = *reinterpret_cast<const float4*>(grad_ptr + 4);
+    float4 d2 = *reinterpret_cast<const float4*>(grad_ptr + 8);
+    float4 d3 = *reinterpret_cast<const float4*>(grad_ptr + 12);
+
+    // Backward iterations: for each Sinkhorn iteration (last to first),
+    // recompute the forward checkpoint then apply backward step
+    for (int iter = num_iters - 1; iter >= 0; iter--) {
+        // Recompute forward from inp to get checkpoint at this iteration
+        // Checkpoint = state after (iter) full iterations + one more row-norm
+        float4 w0 = inp0, w1 = inp1, w2 = inp2, w3 = inp3;
+
+        for (int fwd = 0; fwd < iter; fwd++) {
+            sk4_forward_step(w0, w1, w2, w3, eps);
+        }
+        // One more row-norm (checkpoint is after row-norm, before col-norm)
+        sk4_row_normalize(w0, w1, w2, w3, eps);
+
+        // Backward through col normalization, then row normalization
+        sk4_col_backward(d0, d1, d2, d3, w0, w1, w2, w3);
+        sk4_row_backward(d0, d1, d2, d3, w0, w1, w2, w3);
+    }
+
+    // Write result
+    float* out_ptr = d_inp + batch_idx * 16;
+    *reinterpret_cast<float4*>(out_ptr) = d0;
+    *reinterpret_cast<float4*>(out_ptr + 4) = d1;
+    *reinterpret_cast<float4*>(out_ptr + 8) = d2;
+    *reinterpret_cast<float4*>(out_ptr + 12) = d3;
+}
+
+template<int N_COMPILE>
+__global__ __launch_bounds__(256, 8) void sinkhorn_knopp_batched_n4_kernel(
+    float* __restrict__ out, const float* __restrict__ inp, int B, int num_iters, float eps) {
     static_assert(N_COMPILE == 4,
                   "This kernel is optimized for the case where n=4, which is the special case "
-                  "presented in the paper in section 4.3 introduction.");
+                  "highlighted in the section 4.3 introduction.");
 
     int batch_idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (batch_idx >= B)
@@ -908,9 +1078,11 @@ __global__ void sinkhorn_knopp_batched_n4_kernel(float* __restrict__ out,
 }
 
 template<int N_MAX, int BLOCK_SIZE>
-__global__ void sinkhorn_knopp_batched_kernel(float* __restrict__ out,
-                                              const float* __restrict__ inp, int B, int n,
-                                              int num_iters, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE,
+                             2) void sinkhorn_knopp_batched_kernel(float* __restrict__ out,
+                                                                   const float* __restrict__ inp,
+                                                                   int B, int n, int num_iters,
+                                                                   float eps) {
     int batch_idx = blockIdx.x;
     if (batch_idx >= B)
         return;
@@ -1043,6 +1215,25 @@ inline void sinkhorn_knopp_forward_batched(float* out, const float* inp, int B, 
     sinkhorn_knopp_batched_kernel<N_MAX, BLOCK_SIZE>
         <<<B, BLOCK_SIZE, smem_size, stream>>>(out, inp, B, n, num_iters, eps);
 #endif
+}
+
+inline void sinkhorn_knopp_backward_batched(float* d_inp, const float* grad, const float* M_inp,
+                                            int B, int n, int num_iters, float eps,
+                                            cudaStream_t stream = nullptr) {
+    if (n == 4) {
+        constexpr int THREADS_PER_BLOCK = 256;
+        int num_blocks = (B + THREADS_PER_BLOCK - 1) / THREADS_PER_BLOCK;
+
+        sinkhorn_knopp_backward_batched_n4_kernel<4>
+            <<<num_blocks, THREADS_PER_BLOCK, 0, stream>>>(d_inp, grad, M_inp, B, num_iters, eps);
+        return;
+    }
+
+    // Fallback: launch one backward per batch element
+    for (int b = 0; b < B; b++) {
+        sinkhorn_knopp_backward(d_inp + b * n * n, grad + b * n * n, nullptr, M_inp + b * n * n, n,
+                                num_iters, eps, stream);
+    }
 }
 
 } // namespace mhc

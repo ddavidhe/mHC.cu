@@ -4,25 +4,21 @@
 #include <cmath>
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
+#include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 #include "mhc_types.h"
+
+namespace cg = cooperative_groups;
 
 namespace mhc {
 
 template<int BLOCK_SIZE>
-__global__ void float_to_bf16_kernel(floatX* __restrict__ out, const float* __restrict__ inp,
-                                     int size) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void float_to_bf16_kernel(floatX* __restrict__ out,
+                                                                      const float* __restrict__ inp,
+                                                                      int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         out[idx] = (floatX)inp[idx];
-    }
-}
-
-template<int BLOCK_SIZE>
-__global__ void bf16_to_float_kernel(float* __restrict__ out, const floatX* __restrict__ inp,
-                                     int size) {
-    int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
-    if (idx < size) {
-        out[idx] = (float)inp[idx];
     }
 }
 
@@ -32,13 +28,10 @@ inline void float_to_bf16(floatX* out, const float* inp, int size, cudaStream_t 
     float_to_bf16_kernel<BLOCK_SIZE><<<num_blocks, BLOCK_SIZE, 0, stream>>>(out, inp, size);
 }
 
-inline void bf16_to_float(float* out, const floatX* inp, int size, cudaStream_t stream = nullptr) {
-    constexpr int BLOCK_SIZE = 256;
-    int num_blocks = (size + BLOCK_SIZE - 1) / BLOCK_SIZE;
-    bf16_to_float_kernel<BLOCK_SIZE><<<num_blocks, BLOCK_SIZE, 0, stream>>>(out, inp, size);
-}
 
 __device__ __forceinline__ float fast_exp(float x) {
+    constexpr float kExpClamp = 20.0f;
+    x = fminf(x, kExpClamp);
     return __expf(x);
 }
 
@@ -47,7 +40,7 @@ __device__ __forceinline__ float fast_sigmoid(float x) {
 }
 
 template<int BLOCK_SIZE>
-__global__ void fused_h_activations_kernel(
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void fused_h_activations_kernel(
     float* __restrict__ H_pre_out, float* __restrict__ H_post_out, float* __restrict__ H_res_out,
     const float* __restrict__ H_proj_concat, const float* __restrict__ rms, float alpha_pre,
     float alpha_post, float alpha_res, const float* __restrict__ b_pre,
@@ -92,6 +85,247 @@ __global__ void fused_h_activations_kernel(
     }
 }
 
+// Fused DynamicH backward pre-sinkhorn kernel.
+// Computes sigmoid derivatives for d_tilde_pre/post and recomputes H_res_exp for sinkhorn backward.
+// Grid: [B], Block: [32] (one warp per batch — only n+n+n²=24 elements per batch for n=4).
+template<int BLOCK_SIZE, int MAX_N>
+__global__ __launch_bounds__(BLOCK_SIZE, 4) void fused_h_backward_pre_kernel(
+    float* __restrict__ d_tilde_pre,                  // [B, n]
+    float* __restrict__ d_tilde_post,                 // [B, n]
+    float* __restrict__ H_res_exp,                    // [B, n, n]
+    const float* __restrict__ d_H_pre,                // [B, n]
+    const float* __restrict__ d_H_post,               // [B, n]
+    const float* __restrict__ H_pre_act,              // [B, n] — sigmoid values
+    const float* __restrict__ H_post_act,             // [B, n] — 2*sigmoid values
+    const float* __restrict__ p_concat,               // [B, n+n+n²]
+    const float* __restrict__ rms_inv,                // [B]
+    float alpha_res, const float* __restrict__ b_res, // [n, n]
+    int B, int n) {
+    int b = blockIdx.x;
+    if (b >= B)
+        return;
+
+    int tid = threadIdx.x;
+    int n_sq = n * n;
+    int stride = n + n + n_sq;
+    float r_inv = rms_inv[b];
+
+    // Threads 0..n-1: sigmoid derivative for pre
+    if (tid < n) {
+        float h = H_pre_act[b * n + tid];
+        float dh = d_H_pre[b * n + tid];
+        // sigmoid'(x) = sigmoid(x) * (1 - sigmoid(x))
+        d_tilde_pre[b * n + tid] = dh * h * (1.0f - h);
+    }
+
+    // Threads n..2n-1: sigmoid derivative for post (H_post = 2*sigmoid, so derivative differs)
+    if (tid >= n && tid < 2 * n) {
+        int j = tid - n;
+        float h = H_post_act[b * n + j]; // h = 2*sigmoid(x)
+        float dh = d_H_post[b * n + j];
+        // d/dx[2*sigmoid(x)] = 2*sigmoid(x)*(1-sigmoid(x)) = h*(1-h/2)
+        d_tilde_post[b * n + j] = dh * h * (1.0f - h * 0.5f);
+    }
+
+    // Threads 2n..2n+n²-1: forward recompute tilde_res → H_res_exp
+    if (tid >= 2 * n && tid < stride) {
+        int local = tid - 2 * n;
+        int ii = local / n;
+        int jj = local % n;
+        float p_val = p_concat[b * stride + 2 * n + local];
+        float tilde = alpha_res * p_val * r_inv + b_res[ii * n + jj];
+        tilde = fminf(tilde, 20.0f); // clamp
+        H_res_exp[b * n_sq + local] = __expf(tilde);
+    }
+}
+
+// Fused DynamicH backward post-sinkhorn kernel.
+// Computes d_tilde_res, all parameter gradients, d_p_concat, and d_r.
+// Grid: [B], Block: [32] (one warp per batch).
+template<int BLOCK_SIZE, int MAX_N>
+__global__ __launch_bounds__(BLOCK_SIZE, 4) void fused_h_backward_post_kernel(
+    float* __restrict__ d_p_pre,            // [B, n]
+    float* __restrict__ d_p_post,           // [B, n]
+    float* __restrict__ d_p_res_flat,       // [B, n²]
+    float* __restrict__ d_b_pre,            // [n] — atomicAdd target
+    float* __restrict__ d_b_post,           // [n] — atomicAdd target
+    float* __restrict__ d_b_res,            // [n, n] — atomicAdd target
+    float* __restrict__ d_alpha_pre,        // scalar — atomicAdd target
+    float* __restrict__ d_alpha_post,       // scalar — atomicAdd target
+    float* __restrict__ d_alpha_res,        // scalar — atomicAdd target
+    float* __restrict__ d_r,                // [B]
+    const float* __restrict__ d_H_res_exp,  // [B, n, n] — from sinkhorn backward
+    const float* __restrict__ H_res_exp,    // [B, n, n]
+    const float* __restrict__ d_tilde_pre,  // [B, n]
+    const float* __restrict__ d_tilde_post, // [B, n]
+    const float* __restrict__ p_concat,     // [B, n+n+n²]
+    const float* __restrict__ rms_inv,      // [B]
+    float alpha_pre, float alpha_post, float alpha_res_f, int B, int n) {
+    int b = blockIdx.x;
+    if (b >= B)
+        return;
+
+    int tid = threadIdx.x;
+    int n_sq = n * n;
+    int stride = n + n + n_sq;
+    float r_inv = rms_inv[b];
+    float r_inv2 = r_inv * r_inv;
+
+    // Each thread computes one element and accumulates d_r contribution
+    float my_d_r = 0.0f;
+
+    // Threads 0..n-1: process pre
+    if (tid < n) {
+        float dt = d_tilde_pre[b * n + tid];
+        float p_val = p_concat[b * stride + tid];
+
+        d_p_pre[b * n + tid] = dt * alpha_pre * r_inv;
+        atomicAdd(&d_b_pre[tid], dt);
+        atomicAdd(d_alpha_pre, dt * p_val * r_inv);
+        my_d_r = -(dt * alpha_pre * p_val * r_inv2);
+    }
+
+    // Threads n..2n-1: process post
+    if (tid >= n && tid < 2 * n) {
+        int j = tid - n;
+        float dt = d_tilde_post[b * n + j];
+        float p_val = p_concat[b * stride + n + j];
+
+        d_p_post[b * n + j] = dt * alpha_post * r_inv;
+        atomicAdd(&d_b_post[j], dt);
+        atomicAdd(d_alpha_post, dt * p_val * r_inv);
+        my_d_r = -(dt * alpha_post * p_val * r_inv2);
+    }
+
+    // Threads 2n..2n+n²-1: process res
+    if (tid >= 2 * n && tid < stride) {
+        int local = tid - 2 * n;
+        float d_hre = d_H_res_exp[b * n_sq + local];
+        float hre = H_res_exp[b * n_sq + local];
+        float dt = d_hre * hre; // d_tilde_res
+        float p_val = p_concat[b * stride + 2 * n + local];
+
+        d_p_res_flat[b * n_sq + local] = dt * alpha_res_f * r_inv;
+        atomicAdd(&d_b_res[local], dt);
+        atomicAdd(d_alpha_res, dt * p_val * r_inv);
+        my_d_r = -(dt * alpha_res_f * p_val * r_inv2);
+    }
+
+    // Warp reduction for d_r[b]
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(cg::this_thread_block());
+    float warp_d_r = cg::reduce(warp, my_d_r, cg::plus<float>());
+
+    // For multi-warp blocks, need shared memory reduction
+    if constexpr (BLOCK_SIZE > 32) {
+        extern __shared__ float shared[];
+        int warp_id = threadIdx.x / 32;
+        int lane_id = threadIdx.x % 32;
+        int num_warps = BLOCK_SIZE / 32;
+
+        if (lane_id == 0)
+            shared[warp_id] = warp_d_r;
+        __syncthreads();
+
+        if (warp_id == 0) {
+            float val = (lane_id < num_warps) ? shared[lane_id] : 0.0f;
+            float block_d_r = cg::reduce(warp, val, cg::plus<float>());
+            if (lane_id == 0) {
+                d_r[b] = block_d_r;
+            }
+        }
+    } else {
+        // Single warp — lane 0 writes directly
+        if (tid == 0) {
+            d_r[b] = warp_d_r;
+        }
+    }
+}
+
+// Fused d_r RMS correction kernel.
+// Applies: d_x_flat[b*nC + c] += d_r[b] * x_flat[b*nC + c] * rms_inv[b] / nC
+template<int BLOCK_SIZE>
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void fused_rms_correction_kernel(
+    float* __restrict__ d_x_flat,      // [B, nC] — modified in-place
+    const float* __restrict__ d_r,     // [B]
+    const float* __restrict__ x_flat,  // [B, nC]
+    const float* __restrict__ rms_inv, // [B]
+    int B, int nC) {
+    int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
+    if (idx >= B * nC)
+        return;
+    int b = idx / nC;
+    float scale = d_r[b] * rms_inv[b] / (float)nC;
+    d_x_flat[idx] += scale * x_flat[idx];
+}
+
+inline void fused_h_backward_pre(float* d_tilde_pre, float* d_tilde_post, float* H_res_exp,
+                                 const float* d_H_pre, const float* d_H_post,
+                                 const float* H_pre_act, const float* H_post_act,
+                                 const float* p_concat, const float* rms_inv, float alpha_res,
+                                 const float* b_res, int B, int n, cudaStream_t stream = nullptr) {
+    constexpr int BLOCK = 32;
+    int n_sq = n * n;
+    int stride = n + n + n_sq;
+    // Need at least stride threads per block; use 32 for warp alignment
+    int block_size = ((stride + 31) / 32) * 32;
+    // For typical n=4, stride=24, block_size=32. For n=8, stride=80, block_size=96.
+
+    if (block_size <= 32) {
+        fused_h_backward_pre_kernel<32, 4><<<B, 32, 0, stream>>>(
+            d_tilde_pre, d_tilde_post, H_res_exp, d_H_pre, d_H_post, H_pre_act, H_post_act,
+            p_concat, rms_inv, alpha_res, b_res, B, n);
+    } else if (block_size <= 128) {
+        fused_h_backward_pre_kernel<128, 8><<<B, 128, 0, stream>>>(
+            d_tilde_pre, d_tilde_post, H_res_exp, d_H_pre, d_H_post, H_pre_act, H_post_act,
+            p_concat, rms_inv, alpha_res, b_res, B, n);
+    } else {
+        fused_h_backward_pre_kernel<256, 16><<<B, 256, 0, stream>>>(
+            d_tilde_pre, d_tilde_post, H_res_exp, d_H_pre, d_H_post, H_pre_act, H_post_act,
+            p_concat, rms_inv, alpha_res, b_res, B, n);
+    }
+}
+
+inline void fused_h_backward_post(float* d_p_pre, float* d_p_post, float* d_p_res_flat,
+                                  float* d_b_pre, float* d_b_post, float* d_b_res,
+                                  float* d_alpha_pre, float* d_alpha_post, float* d_alpha_res,
+                                  float* d_r, const float* d_H_res_exp, const float* H_res_exp,
+                                  const float* d_tilde_pre, const float* d_tilde_post,
+                                  const float* p_concat, const float* rms_inv, float alpha_pre,
+                                  float alpha_post, float alpha_res, int B, int n,
+                                  cudaStream_t stream = nullptr) {
+    int n_sq = n * n;
+    int stride = n + n + n_sq;
+    int block_size = ((stride + 31) / 32) * 32;
+
+    if (block_size <= 32) {
+        fused_h_backward_post_kernel<32, 4><<<B, 32, 0, stream>>>(
+            d_p_pre, d_p_post, d_p_res_flat, d_b_pre, d_b_post, d_b_res, d_alpha_pre, d_alpha_post,
+            d_alpha_res, d_r, d_H_res_exp, H_res_exp, d_tilde_pre, d_tilde_post, p_concat, rms_inv,
+            alpha_pre, alpha_post, alpha_res, B, n);
+    } else if (block_size <= 128) {
+        size_t smem = (128 / 32) * sizeof(float);
+        fused_h_backward_post_kernel<128, 8><<<B, 128, smem, stream>>>(
+            d_p_pre, d_p_post, d_p_res_flat, d_b_pre, d_b_post, d_b_res, d_alpha_pre, d_alpha_post,
+            d_alpha_res, d_r, d_H_res_exp, H_res_exp, d_tilde_pre, d_tilde_post, p_concat, rms_inv,
+            alpha_pre, alpha_post, alpha_res, B, n);
+    } else {
+        size_t smem = (256 / 32) * sizeof(float);
+        fused_h_backward_post_kernel<256, 16><<<B, 256, smem, stream>>>(
+            d_p_pre, d_p_post, d_p_res_flat, d_b_pre, d_b_post, d_b_res, d_alpha_pre, d_alpha_post,
+            d_alpha_res, d_r, d_H_res_exp, H_res_exp, d_tilde_pre, d_tilde_post, p_concat, rms_inv,
+            alpha_pre, alpha_post, alpha_res, B, n);
+    }
+}
+
+inline void fused_rms_correction(float* d_x_flat, const float* d_r, const float* x_flat,
+                                 const float* rms_inv, int B, int nC,
+                                 cudaStream_t stream = nullptr) {
+    constexpr int BLOCK = 256;
+    int blocks = (B * nC + BLOCK - 1) / BLOCK;
+    fused_rms_correction_kernel<BLOCK>
+        <<<blocks, BLOCK, 0, stream>>>(d_x_flat, d_r, x_flat, rms_inv, B, nC);
+}
+
 inline void fused_h_activations(float* H_pre_out, float* H_post_out, float* H_res_out,
                                 const float* H_proj_concat, const float* rms, float alpha_pre,
                                 float alpha_post, float alpha_res, const float* b_pre,
@@ -125,7 +359,7 @@ inline void fused_h_activations(float* H_pre_out, float* H_post_out, float* H_re
 #endif
 }
 
-__global__ void flush_l2_kernel(float* buf, int size) {
+__global__ __launch_bounds__(256, 4) void flush_l2_kernel(float* buf, int size) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx < size) {
         buf[idx] = buf[idx] + 1.0f;

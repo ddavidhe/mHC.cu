@@ -11,9 +11,11 @@ namespace cg = cooperative_groups;
 namespace mhc {
 
 template<int BLOCK_SIZE, bool OUTPUT_RMS = false>
-__global__ void rmsnorm_kernel(floatX* __restrict__ out, float* __restrict__ rms_out,
-                               const floatX* __restrict__ inp, const floatX* __restrict__ weight,
-                               int N, int C, float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void rmsnorm_kernel(float* __restrict__ out,
+                                                                float* __restrict__ rms_out,
+                                                                const float* __restrict__ inp,
+                                                                const floatX* __restrict__ weight,
+                                                                int N, int C, float eps) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 
@@ -21,15 +23,15 @@ __global__ void rmsnorm_kernel(floatX* __restrict__ out, float* __restrict__ rms
     if (idx >= N)
         return;
 
-    const floatX* x = inp + idx * C;
-    floatX* o = out + idx * C;
+    const float* x = inp + idx * C;
+    float* o = out + idx * C;
 
     extern __shared__ float shared[];
     float* s_sum_sq = shared;
 
     float thread_sum_sq = 0.0f;
     for (int i = threadIdx.x; i < C; i += BLOCK_SIZE) {
-        float val = (float)x[i];
+        float val = x[i];
         thread_sum_sq += val * val;
     }
 
@@ -62,17 +64,16 @@ __global__ void rmsnorm_kernel(floatX* __restrict__ out, float* __restrict__ rms
     float rms_inv = s_sum_sq[0];
 
     for (int i = threadIdx.x; i < C; i += BLOCK_SIZE) {
-        float val = (float)x[i];
+        float val = x[i];
         float w = (float)weight[i];
-        o[i] = (floatX)(val * rms_inv * w);
+        o[i] = val * rms_inv * w;
     }
 }
 
 template<int BLOCK_SIZE, bool OUTPUT_RMS = false>
-__global__ void rmsnorm_kernel_vectorized(floatX* __restrict__ out, float* __restrict__ rms_out,
-                                          const floatX* __restrict__ inp,
-                                          const floatX* __restrict__ weight, int N, int C,
-                                          float eps) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void rmsnorm_kernel_vectorized(
+    float* __restrict__ out, float* __restrict__ rms_out, const float* __restrict__ inp,
+    const floatX* __restrict__ weight, int N, int C, float eps) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 
@@ -80,34 +81,27 @@ __global__ void rmsnorm_kernel_vectorized(floatX* __restrict__ out, float* __res
     if (idx >= N)
         return;
 
-    const floatX* x = inp + idx * C;
-    floatX* o = out + idx * C;
+    const float* x = inp + idx * C;
+    float* o = out + idx * C;
 
     extern __shared__ float shared[];
     float* s_sum_sq = shared;
 
-    constexpr int VEC_SIZE = 8;
+    constexpr int VEC_SIZE = 4;
     int C_vec = C / VEC_SIZE;
 
     float thread_sum_sq = 0.0f;
 
-    using vec_t = float4;
-    const vec_t* x_vec = reinterpret_cast<const vec_t*>(x);
+    const float4* x_vec = reinterpret_cast<const float4*>(x);
 
     for (int i = threadIdx.x; i < C_vec; i += BLOCK_SIZE) {
-        vec_t v = x_vec[i];
-        nv_bfloat162* bf_v = reinterpret_cast<nv_bfloat162*>(&v);
-
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            float2 f = __bfloat1622float2(bf_v[j]);
-            thread_sum_sq += f.x * f.x + f.y * f.y;
-        }
+        float4 v = x_vec[i];
+        thread_sum_sq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
     }
 
     int remainder_start = C_vec * VEC_SIZE;
     for (int i = remainder_start + threadIdx.x; i < C; i += BLOCK_SIZE) {
-        float val = (float)x[i];
+        float val = x[i];
         thread_sum_sq += val * val;
     }
 
@@ -139,40 +133,44 @@ __global__ void rmsnorm_kernel_vectorized(floatX* __restrict__ out, float* __res
 
     float rms_inv = s_sum_sq[0];
 
-    vec_t* o_vec = reinterpret_cast<vec_t*>(o);
-    const vec_t* w_vec = reinterpret_cast<const vec_t*>(weight);
+    // Output as fp32: read fp32 input, bf16 weight, compute in fp32, write fp32
+    // Weight is bf16: load as float4 (8 bf16 = 16 bytes), process 4 elements per half
+    constexpr int W_VEC_SIZE = 8;
+    int C_w_vec = C / W_VEC_SIZE;
+    float4* o_vec = reinterpret_cast<float4*>(o);
+    using w_vec_t = float4;
+    const w_vec_t* w_vec = reinterpret_cast<const w_vec_t*>(weight);
 
-    for (int i = threadIdx.x; i < C_vec; i += BLOCK_SIZE) {
-        vec_t xv = x_vec[i];
-        vec_t wv = w_vec[i];
-
-        nv_bfloat162* bf_x = reinterpret_cast<nv_bfloat162*>(&xv);
+    for (int i = threadIdx.x; i < C_w_vec; i += BLOCK_SIZE) {
+        // Input: 2 float4s = 8 floats
+        float4 xv0 = x_vec[i * 2 + 0];
+        float4 xv1 = x_vec[i * 2 + 1];
+        // Weight: 1 float4 = 8 bf16 values
+        w_vec_t wv = w_vec[i];
         nv_bfloat162* bf_w = reinterpret_cast<nv_bfloat162*>(&wv);
 
-        vec_t ov;
-        nv_bfloat162* bf_o = reinterpret_cast<nv_bfloat162*>(&ov);
+        float2 wf0 = __bfloat1622float2(bf_w[0]);
+        float2 wf1 = __bfloat1622float2(bf_w[1]);
+        float2 wf2 = __bfloat1622float2(bf_w[2]);
+        float2 wf3 = __bfloat1622float2(bf_w[3]);
 
-#pragma unroll
-        for (int j = 0; j < 4; j++) {
-            float2 xf = __bfloat1622float2(bf_x[j]);
-            float2 wf = __bfloat1622float2(bf_w[j]);
-            float2 of;
-            of.x = xf.x * rms_inv * wf.x;
-            of.y = xf.y * rms_inv * wf.y;
-            bf_o[j] = __float22bfloat162_rn(of);
-        }
-
-        o_vec[i] = ov;
+        float4 ov0 = {xv0.x * rms_inv * wf0.x, xv0.y * rms_inv * wf0.y, xv0.z * rms_inv * wf1.x,
+                      xv0.w * rms_inv * wf1.y};
+        float4 ov1 = {xv1.x * rms_inv * wf2.x, xv1.y * rms_inv * wf2.y, xv1.z * rms_inv * wf3.x,
+                      xv1.w * rms_inv * wf3.y};
+        o_vec[i * 2 + 0] = ov0;
+        o_vec[i * 2 + 1] = ov1;
     }
 
-    for (int i = remainder_start + threadIdx.x; i < C; i += BLOCK_SIZE) {
-        float val = (float)x[i];
+    int vec_remainder_start = C_w_vec * W_VEC_SIZE;
+    for (int i = vec_remainder_start + threadIdx.x; i < C; i += BLOCK_SIZE) {
+        float val = x[i];
         float w = (float)weight[i];
-        o[i] = (floatX)(val * rms_inv * w);
+        o[i] = val * rms_inv * w;
     }
 }
 
-inline void rmsnorm_forward(floatX* out, const floatX* inp, const floatX* weight, int N, int C,
+inline void rmsnorm_forward(float* out, const float* inp, const floatX* weight, int N, int C,
                             float eps, cudaStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
     int num_warps = BLOCK_SIZE / 32;
@@ -190,7 +188,7 @@ inline void rmsnorm_forward(floatX* out, const floatX* inp, const floatX* weight
     }
 }
 
-inline void rmsnorm_forward_with_rms(floatX* out, float* rms_out, const floatX* inp,
+inline void rmsnorm_forward_with_rms(float* out, float* rms_out, const float* inp,
                                      const floatX* weight, int N, int C, float eps,
                                      cudaStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;
@@ -231,11 +229,10 @@ inline void rmsnorm_forward_with_rms(floatX* out, float* rms_out, const floatX* 
 #endif
 }
 template<int BLOCK_SIZE>
-__global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __restrict__ d_weight,
-                                        const float* __restrict__ grad,
-                                        const floatX* __restrict__ inp,
-                                        const floatX* __restrict__ weight,
-                                        const float* __restrict__ rms, int N, int C) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void rmsnorm_backward_kernel(
+    float* __restrict__ d_inp, float* __restrict__ d_weight, const float* __restrict__ grad,
+    const float* __restrict__ inp, const floatX* __restrict__ weight, const float* __restrict__ rms,
+    int N, int C) {
     cg::thread_block block = cg::this_thread_block();
     cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
 
@@ -243,7 +240,7 @@ __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __rest
     if (idx >= N)
         return;
 
-    const floatX* x = inp + idx * C;
+    const float* x = inp + idx * C;
     const float* g = grad + idx * C;
     float* dx = d_inp + idx * C;
     float r = rms[idx];
@@ -256,7 +253,7 @@ __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __rest
     for (int i = threadIdx.x; i < C; i += BLOCK_SIZE) {
         float g_val = g[i];
         float w_val = (float)weight[i];
-        float x_val = (float)x[i];
+        float x_val = x[i];
         thread_dot += g_val * w_val * x_val;
     }
 
@@ -286,7 +283,7 @@ __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __rest
     for (int i = threadIdx.x; i < C; i += BLOCK_SIZE) {
         float g_val = g[i];
         float w_val = (float)weight[i];
-        float x_val = (float)x[i];
+        float x_val = x[i];
 
         dx[i] = (g_val * w_val * r_inv) - (x_val * correction * r_inv);
 
@@ -294,7 +291,7 @@ __global__ void rmsnorm_backward_kernel(float* __restrict__ d_inp, float* __rest
     }
 }
 
-inline void rmsnorm_backward(float* d_inp, float* d_weight, const float* grad, const floatX* inp,
+inline void rmsnorm_backward(float* d_inp, float* d_weight, const float* grad, const float* inp,
                              const floatX* weight, const float* rms, int N, int C,
                              cudaStream_t stream = nullptr) {
     constexpr int BLOCK_SIZE = 512;

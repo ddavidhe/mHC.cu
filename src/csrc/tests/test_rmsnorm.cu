@@ -47,13 +47,12 @@ int main() {
         h_weight[i] = (float)rand() / RAND_MAX * 0.5f + 0.75f;
     }
 
-    floatX* h_inp_bf16 = (floatX*)malloc(N * C * sizeof(floatX));
     floatX* h_weight_bf16 = (floatX*)malloc(C * sizeof(floatX));
-    floatX* h_out_bf16 = (floatX*)malloc(N * C * sizeof(floatX));
 
+    // Round inputs through bf16 to match what the kernel sees
     for (int i = 0; i < N * C; i++) {
-        h_inp_bf16[i] = (floatX)h_inp[i];
-        h_inp[i] = (float)h_inp_bf16[i];
+        floatX tmp = (floatX)h_inp[i];
+        h_inp[i] = (float)tmp;
     }
     for (int i = 0; i < C; i++) {
         h_weight_bf16[i] = (floatX)h_weight[i];
@@ -62,22 +61,19 @@ int main() {
 
     rmsnorm_cpu_reference(h_out_ref, h_inp, h_weight, N, C, eps);
 
-    floatX *d_inp, *d_weight, *d_out;
-    CHECK_CUDA(cudaMalloc(&d_inp, N * C * sizeof(floatX)));
+    float *d_inp, *d_out;
+    floatX* d_weight;
+    CHECK_CUDA(cudaMalloc(&d_inp, N * C * sizeof(float)));
     CHECK_CUDA(cudaMalloc(&d_weight, C * sizeof(floatX)));
-    CHECK_CUDA(cudaMalloc(&d_out, N * C * sizeof(floatX)));
+    CHECK_CUDA(cudaMalloc(&d_out, N * C * sizeof(float)));
 
-    CHECK_CUDA(cudaMemcpy(d_inp, h_inp_bf16, N * C * sizeof(floatX), cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_inp, h_inp, N * C * sizeof(float), cudaMemcpyHostToDevice));
     CHECK_CUDA(cudaMemcpy(d_weight, h_weight_bf16, C * sizeof(floatX), cudaMemcpyHostToDevice));
 
     rmsnorm_forward(d_out, d_inp, d_weight, N, C, eps);
     CHECK_CUDA(cudaDeviceSynchronize());
 
-    CHECK_CUDA(cudaMemcpy(h_out_bf16, d_out, N * C * sizeof(floatX), cudaMemcpyDeviceToHost));
-
-    for (int i = 0; i < N * C; i++) {
-        h_out_gpu[i] = (float)h_out_bf16[i];
-    }
+    CHECK_CUDA(cudaMemcpy(h_out_gpu, d_out, N * C * sizeof(float), cudaMemcpyDeviceToHost));
 
     float max_diff = max_abs_diff(h_out_ref, h_out_gpu, N * C);
 
@@ -101,9 +97,7 @@ int main() {
     free(h_weight);
     free(h_out_ref);
     free(h_out_gpu);
-    free(h_inp_bf16);
     free(h_weight_bf16);
-    free(h_out_bf16);
 
     return 0;
 }

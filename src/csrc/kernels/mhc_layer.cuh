@@ -99,10 +99,8 @@ struct MHCLayerWeights {
 
 struct MHCLayerBuffers {
     float* x_expanded;
-    floatX* x_aggregated_bf16;
     float* x_aggregated_f32;
     float* rms_values;
-    floatX* layer_out_bf16;
     float* layer_out_f32;
     float* y_distributed;
     float* sinkhorn_M;
@@ -134,10 +132,8 @@ struct MHCLayerBuffers {
         dynamic_h = use_dynamic_h;
 
         CHECK_CUDA(cudaMalloc(&x_expanded, B * n * C * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&x_aggregated_bf16, B * C * sizeof(floatX)));
         CHECK_CUDA(cudaMalloc(&x_aggregated_f32, B * C * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&rms_values, B * sizeof(float)));
-        CHECK_CUDA(cudaMalloc(&layer_out_bf16, B * C * sizeof(floatX)));
         CHECK_CUDA(cudaMalloc(&layer_out_f32, B * C * sizeof(float)));
         CHECK_CUDA(cudaMalloc(&y_distributed, B * n * C * sizeof(float)));
         if (needs_x_mixed) {
@@ -174,10 +170,8 @@ struct MHCLayerBuffers {
             return;
 
         cudaFree(x_expanded);
-        cudaFree(x_aggregated_bf16);
         cudaFree(x_aggregated_f32);
         cudaFree(rms_values);
-        cudaFree(layer_out_bf16);
         cudaFree(layer_out_f32);
         cudaFree(y_distributed);
         cudaFree(sinkhorn_M);
@@ -282,17 +276,20 @@ struct MHCLayerGradients {
 };
 
 template<int BLOCK_SIZE>
-__global__ void sigmoid_kernel(float* __restrict__ out, const float* __restrict__ inp, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sigmoid_kernel(float* __restrict__ out,
+                                                                const float* __restrict__ inp,
+                                                                int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         float x = inp[idx];
-        out[idx] = fast_sigmoid(-x);
+        out[idx] = fast_sigmoid(x);
     }
 }
 
 template<int BLOCK_SIZE>
-__global__ void sigmoid_scale_kernel(float* __restrict__ out, const float* __restrict__ inp,
-                                     float scale, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sigmoid_scale_kernel(float* __restrict__ out,
+                                                                      const float* __restrict__ inp,
+                                                                      float scale, int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         float x = inp[idx];
@@ -301,7 +298,9 @@ __global__ void sigmoid_scale_kernel(float* __restrict__ out, const float* __res
 }
 
 template<int BLOCK_SIZE>
-__global__ void exp_kernel(float* __restrict__ out, const float* __restrict__ inp, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void exp_kernel(float* __restrict__ out,
+                                                            const float* __restrict__ inp,
+                                                            int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         out[idx] = fast_exp(inp[idx]);
@@ -309,8 +308,11 @@ __global__ void exp_kernel(float* __restrict__ out, const float* __restrict__ in
 }
 
 template<int BLOCK_SIZE>
-__global__ void sigmoid_backward_kernel(float* __restrict__ d_inp, const float* __restrict__ d_out,
-                                        const float* __restrict__ activated, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE,
+                             2) void sigmoid_backward_kernel(float* __restrict__ d_inp,
+                                                             const float* __restrict__ d_out,
+                                                             const float* __restrict__ activated,
+                                                             int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         float s = activated[idx];
@@ -319,9 +321,9 @@ __global__ void sigmoid_backward_kernel(float* __restrict__ d_inp, const float* 
 }
 
 template<int BLOCK_SIZE>
-__global__ void
-sigmoid_scale_backward_kernel(float* __restrict__ d_inp, const float* __restrict__ d_out,
-                              const float* __restrict__ activated, float scale, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void sigmoid_scale_backward_kernel(
+    float* __restrict__ d_inp, const float* __restrict__ d_out, const float* __restrict__ activated,
+    float scale, int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         float s = activated[idx] / scale;
@@ -330,8 +332,11 @@ sigmoid_scale_backward_kernel(float* __restrict__ d_inp, const float* __restrict
 }
 
 template<int BLOCK_SIZE>
-__global__ void exp_backward_kernel(float* __restrict__ d_inp, const float* __restrict__ d_out,
-                                    const float* __restrict__ exp_val, int size) {
+__global__ __launch_bounds__(BLOCK_SIZE,
+                             2) void exp_backward_kernel(float* __restrict__ d_inp,
+                                                         const float* __restrict__ d_out,
+                                                         const float* __restrict__ exp_val,
+                                                         int size) {
     int idx = blockIdx.x * BLOCK_SIZE + threadIdx.x;
     if (idx < size) {
         d_inp[idx] = d_out[idx] * exp_val[idx];
@@ -369,7 +374,7 @@ inline void exp_backward(float* d_inp, const float* d_out, const float* exp_val,
 }
 
 template<int BLOCK_SIZE>
-__global__ void apply_dynamic_h_activations_kernel(
+__global__ __launch_bounds__(BLOCK_SIZE, 2) void apply_dynamic_h_activations_kernel(
     float* __restrict__ H_pre_out, float* __restrict__ H_post_out, float* __restrict__ H_res_out,
     const float* __restrict__ H_proj_raw, const float* __restrict__ b_pre,
     const float* __restrict__ b_post, const float* __restrict__ b_res, float alpha_pre,
@@ -584,7 +589,7 @@ struct MHCLayer {
         if (config.use_dynamic_h) {
             compute_dynamic_h_internal(B, n, C);
 
-            stream_aggregate_bf16_dynamic(buffers.x_aggregated_bf16, buffers.x_expanded,
+            stream_aggregate_bf16_dynamic(buffers.x_aggregated_f32, buffers.x_expanded,
                                           buffers.H_pre_activated, B, n, C, stream);
         } else {
             if (use_pipelining) {
@@ -594,7 +599,7 @@ struct MHCLayer {
                 CHECK_CUDA(cudaEventRecord(sinkhorn_done, sinkhorn_stream));
             }
 
-            stream_aggregate_bf16_fused_sigmoid(buffers.x_aggregated_bf16, buffers.H_pre_activated,
+            stream_aggregate_bf16_fused_sigmoid(buffers.x_aggregated_f32, buffers.H_pre_activated,
                                                 buffers.x_expanded, weights.b_pre, B, n, C, stream);
 
             if (!use_pipelining) {
@@ -606,24 +611,24 @@ struct MHCLayer {
             }
         }
 
-        rmsnorm_forward_with_rms(buffers.layer_out_bf16, buffers.rms_values,
-                                 buffers.x_aggregated_bf16, weights.rmsnorm_weight, B, C,
-                                 config.eps, stream);
+        rmsnorm_forward_with_rms(buffers.layer_out_f32, buffers.rms_values,
+                                 buffers.x_aggregated_f32, weights.rmsnorm_weight, B, C, config.eps,
+                                 stream);
 
         if (config.use_dynamic_h) {
-            stream_distribute_mix_add_fused_dynamic(
-                buffers.output, buffers.x_expanded, buffers.layer_out_bf16,
-                buffers.H_post_activated, buffers.sinkhorn_M, B, n, C, stream);
+            stream_distribute_mix_add_fused_dynamic(buffers.output, buffers.x_expanded,
+                                                    buffers.layer_out_f32, buffers.H_post_activated,
+                                                    buffers.sinkhorn_M, B, n, C, stream);
         } else {
             if (use_tc_mix) {
                 stream_mix_tc.forward_fused_distribute_add(
                     buffers.output, buffers.H_post_activated, buffers.x_expanded,
-                    buffers.layer_out_bf16, buffers.sinkhorn_M, weights.b_post, buffers.x_mixed,
+                    buffers.layer_out_f32, buffers.sinkhorn_M, weights.b_post, buffers.x_mixed,
                     stream);
             } else {
                 stream_distribute_mix_add_fused(
                     buffers.output, buffers.H_post_activated, buffers.x_expanded,
-                    buffers.layer_out_bf16, weights.b_post, buffers.sinkhorn_M, B, n, C, stream);
+                    buffers.layer_out_f32, weights.b_post, buffers.sinkhorn_M, B, n, C, stream);
             }
         }
     }
@@ -639,7 +644,7 @@ struct MHCLayer {
         if (config.use_dynamic_h) {
             compute_dynamic_h_internal(B, n, C);
 
-            stream_aggregate_bf16_dynamic(buffers.x_aggregated_bf16, buffers.x_expanded,
+            stream_aggregate_bf16_dynamic(buffers.x_aggregated_f32, buffers.x_expanded,
                                           buffers.H_pre_activated, B, n, C, stream);
         } else {
             if (use_pipelining) {
@@ -649,7 +654,7 @@ struct MHCLayer {
                 CHECK_CUDA(cudaEventRecord(sinkhorn_done, sinkhorn_stream));
             }
 
-            stream_aggregate_bf16_fused_sigmoid(buffers.x_aggregated_bf16, buffers.H_pre_activated,
+            stream_aggregate_bf16_fused_sigmoid(buffers.x_aggregated_f32, buffers.H_pre_activated,
                                                 buffers.x_expanded, weights.b_pre, B, n, C, stream);
 
             if (!use_pipelining) {
@@ -661,24 +666,24 @@ struct MHCLayer {
             }
         }
 
-        rmsnorm_forward_with_rms(buffers.layer_out_bf16, buffers.rms_values,
-                                 buffers.x_aggregated_bf16, weights.rmsnorm_weight, B, C,
-                                 config.eps, stream);
+        rmsnorm_forward_with_rms(buffers.layer_out_f32, buffers.rms_values,
+                                 buffers.x_aggregated_f32, weights.rmsnorm_weight, B, C, config.eps,
+                                 stream);
 
         if (config.use_dynamic_h) {
-            stream_distribute_mix_add_fused_dynamic(
-                buffers.output, buffers.x_expanded, buffers.layer_out_bf16,
-                buffers.H_post_activated, buffers.sinkhorn_M, B, n, C, stream);
+            stream_distribute_mix_add_fused_dynamic(buffers.output, buffers.x_expanded,
+                                                    buffers.layer_out_f32, buffers.H_post_activated,
+                                                    buffers.sinkhorn_M, B, n, C, stream);
         } else {
             if (use_tc_mix) {
                 stream_mix_tc.forward_fused_distribute_add(
                     buffers.output, buffers.H_post_activated, buffers.x_expanded,
-                    buffers.layer_out_bf16, buffers.sinkhorn_M, weights.b_post, buffers.x_mixed,
+                    buffers.layer_out_f32, buffers.sinkhorn_M, weights.b_post, buffers.x_mixed,
                     stream);
             } else {
                 stream_distribute_mix_add_fused(
                     buffers.output, buffers.H_post_activated, buffers.x_expanded,
-                    buffers.layer_out_bf16, weights.b_post, buffers.sinkhorn_M, B, n, C, stream);
+                    buffers.layer_out_f32, weights.b_post, buffers.sinkhorn_M, B, n, C, stream);
             }
         }
     }
@@ -699,8 +704,6 @@ struct MHCLayer {
 
         grads.zero_weight_grads(C, n, stream);
 
-        bf16_to_float(buffers.layer_out_f32, buffers.layer_out_bf16, B * C, stream);
-
         stream_distribute_mix_backward_fused(
             grads.d_x_mixed, grads.d_layer_out, grads.d_M, grads.d_H_post_activated, d_output,
             buffers.x_expanded, buffers.layer_out_f32, buffers.sinkhorn_M, buffers.H_post_activated,
@@ -714,11 +717,9 @@ struct MHCLayer {
         sigmoid_scale_backward(grads.d_H_post, grads.d_H_post_activated, buffers.H_post_activated,
                                2.0f, n, stream);
 
-        bf16_to_float(buffers.x_aggregated_f32, buffers.x_aggregated_bf16, B * C, stream);
-
         rmsnorm_backward(grads.d_x_aggregated, grads.d_rmsnorm_weight, grads.d_layer_out,
-                         buffers.x_aggregated_bf16, weights.rmsnorm_weight, buffers.rms_values, B,
-                         C, stream);
+                         buffers.x_aggregated_f32, weights.rmsnorm_weight, buffers.rms_values, B, C,
+                         stream);
 
         stream_aggregate_backward(grads.d_x_expanded, grads.d_H_pre_activated, grads.d_x_aggregated,
                                   buffers.x_expanded, buffers.H_pre_activated, B, n, C,
