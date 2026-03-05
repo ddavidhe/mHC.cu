@@ -6,8 +6,13 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 def get_cuda_arch_flags():
     import torch
 
+    cuda_arch = os.environ.get("CUDA_ARCH")
+    if cuda_arch:
+        return [f"-gencode=arch=compute_{cuda_arch},code=sm_{cuda_arch}"]
     if not torch.cuda.is_available():
-        raise RuntimeError("CUDA is required to build mhc")
+        raise RuntimeError(
+            "CUDA is required to build mhc (set CUDA_ARCH env var for headless builds)"
+        )
     major, minor = torch.cuda.get_device_capability()
     return [f"-gencode=arch=compute_{major}{minor},code=sm_{major}{minor}"]
 
@@ -15,6 +20,12 @@ def get_cuda_arch_flags():
 def get_extra_defines():
     import torch
 
+    cuda_arch = os.environ.get("CUDA_ARCH")
+    if cuda_arch:
+        defines = []
+        if int(cuda_arch) >= 90:
+            defines.append("-DMHC_ENABLE_PDL")
+        return defines
     if not torch.cuda.is_available():
         return []
     major, _ = torch.cuda.get_device_capability()

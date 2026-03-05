@@ -575,6 +575,9 @@ def run_training(argv: Optional[list[str]] = None):
     if use_fused_mhc and mhc_cuda is None:
         print("mhc_cuda not found; falling back to python mHC path.")
         use_fused_mhc = False
+    print(
+        f"mhc_cuda: {'available' if mhc_cuda is not None else 'NOT available'}, use_fused_mhc={use_fused_mhc}"
+    )
     if use_fused_mhc and args.sinkhorn_eps != args.rmsnorm_eps:
         fused_eps = max(args.sinkhorn_eps, args.rmsnorm_eps)
         print(f"Fused mHC uses a single eps; using eps={fused_eps:g}.")

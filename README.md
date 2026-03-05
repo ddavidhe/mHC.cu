@@ -41,13 +41,13 @@ make benchgen-check
 ### Test
 
 ```bash
-# python bench
+# python tests
 modal run runmodal.py --gpu h100 --mode test --scope python
 
-# cpp / cuda bench
+# c++ / cuda tests
 modal run runmodal.py --gpu h100 --mode test --scope native
 
-# run all benches
+# run all tests
 modal run runmodal.py --gpu h100 --mode test --scope all
 ```
 
@@ -77,7 +77,7 @@ modal run runmodal.py --gpu b200 --mode train --train-args "\
 Download checkpoints and metrics after the run:
 
 ```bash
-modal volume get mhc-runs:/runs/train-3b ./runs/train-3b
+modal volume get mhc-runs /train-3b ./runs
 ```
 
 ## Local 
