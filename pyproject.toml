@@ -1,25 +1,48 @@
 [build-system]
-requires = ["setuptools>=45", "wheel", "torch>=2.0.0"]
+requires = ["setuptools>=68", "wheel", "torch>=2.0.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mhc"
+name = "mhc-cuda"
 version = "0.1.0"
 description = "CUDA implementation of Manifold-Constrained Hyper-Connections"
 readme = "README.md"
 license = {text = "MIT"}
-requires-python = ">=3.8"
-dependencies = [
-  "accelerate>=0.26.0",
-  "datasets",
-  "safetensors",
-  "sentencepiece",
-  "tiktoken",
-  "torch>=2.0.0",
-  "tqdm",
-  "transformers",
+requires-python = ">=3.10"
+authors = [
+    {name = "Andre Slavescu"}
 ]
+keywords = ["cuda", "deep-learning", "pytorch", "hyper-connections", "mhc"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: POSIX :: Linux",
+    "Environment :: GPU :: NVIDIA CUDA",
+]
+dependencies = [
+    "accelerate>=0.26.0",
+    "datasets",
+    "safetensors",
+    "sentencepiece",
+    "tiktoken",
+    "torch>=2.0.0",
+    "tqdm",
+    "transformers",
+]
+
+[project.optional-dependencies]
+dev = ["black", "pytest", "ruff"]
 
 [project.urls]
 Homepage = "https://github.com/AndreSlavescu/mHC.cu"
+Repository = "https://github.com/AndreSlavescu/mHC.cu"
 Paper = "https://arxiv.org/abs/2512.24880"
+"Bug Tracker" = "https://github.com/AndreSlavescu/mHC.cu/issues"

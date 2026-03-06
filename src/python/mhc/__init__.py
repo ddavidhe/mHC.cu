@@ -1,3 +1,5 @@
+__version__ = "0.1.0"
+
 from .layer import MHCLayer
 
 try:
@@ -16,6 +18,7 @@ except ImportError:  # mhc_cuda not built; fused ops unavailable
     mhc_layer_fused_dynamic_inference = None
 
 __all__ = [
+    "__version__",
     "MHCLayer",
     "sinkhorn_knopp",
     "rmsnorm",

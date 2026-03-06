@@ -1,0 +1,22 @@
+# CUDA / C++ sources needed to compile the mhc_cuda extension
+include src/python/bindings.cu
+recursive-include src/csrc/include *.h *.cuh
+recursive-include src/csrc/kernels *.cuh *.cu
+
+# Package metadata
+include LICENSE
+include README.md
+include pyproject.toml
+include setup.py
+
+# Exclude build artifacts, tests, benchmarks from sdist
+prune build
+prune .stamps
+prune src/csrc/tests
+prune src/csrc/benchmarks
+prune src/python/tests
+prune src/python/benchmarks
+global-exclude __pycache__
+global-exclude *.pyc
+global-exclude *.so
+global-exclude *.o

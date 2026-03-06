@@ -1,9 +1,17 @@
 import os
+import sys
 from setuptools import setup, find_packages
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
+def _is_sdist_build():
+    return "sdist" in sys.argv or "egg_info" in sys.argv
+
+
 def get_cuda_arch_flags():
+    if _is_sdist_build():
+        return []
+
     import torch
 
     cuda_arch = os.environ.get("CUDA_ARCH")
@@ -18,6 +26,9 @@ def get_cuda_arch_flags():
 
 
 def get_extra_defines():
+    if _is_sdist_build():
+        return []
+
     import torch
 
     cuda_arch = os.environ.get("CUDA_ARCH")
@@ -36,10 +47,12 @@ def get_extra_defines():
 
 
 setup(
-    name="mhc",
+    name="mhc-cuda",
     version="0.1.0",
     description="CUDA implementation of Manifold-Constrained Hyper-Connections",
-    author="DeepSeek-AI (paper), Andre Slavescu (implementation)",
+    long_description=open("README.md").read() if os.path.exists("README.md") else "",
+    long_description_content_type="text/markdown",
+    author="Andre Slavescu",
     url="https://github.com/AndreSlavescu/mHC.cu",
     packages=find_packages(where="src/python"),
     package_dir={"": "src/python"},
@@ -48,8 +61,12 @@ setup(
             name="mhc_cuda",
             sources=["src/python/bindings.cu"],
             include_dirs=[
-                os.path.join(os.path.dirname(__file__), "src/csrc/include"),
-                os.path.join(os.path.dirname(__file__), "src/csrc/kernels"),
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "src/csrc/include"
+                ),
+                os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), "src/csrc/kernels"
+                ),
             ],
             extra_compile_args={
                 "cxx": ["-O3"],
@@ -80,6 +97,6 @@ setup(
         "transformers",
     ],
     extras_require={
-        "dev": ["black", "pytest"],
+        "dev": ["black", "pytest", "ruff"],
     },
 )

@@ -1,0 +1,64 @@
+name: Publish to PyPI
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  build-sdist:
+    name: Build source distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build dependencies
+        run: pip install build torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build sdist
+        run: python -m build --sdist
+
+      - name: Verify sdist contents
+        run: |
+          echo "=== sdist contents ==="
+          tar tzf dist/*.tar.gz | head -80
+          echo ""
+          echo "=== Checking for required CUDA sources ==="
+          tar tzf dist/*.tar.gz | grep -E "(bindings\.cu|mhc_types\.h|utils\.cuh|rmsnorm\.cuh|sinkhorn_knopp\.cuh|stream_ops\.cuh|fused_rmsnorm_matmul\.cuh|profiling\.cuh)" || {
+            echo "ERROR: Missing required CUDA source files in sdist!"
+            exit 1
+          }
+          echo ""
+          echo "=== All required files present ==="
+
+      - name: Upload sdist artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  publish:
+    name: Publish to PyPI
+    needs: build-sdist
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/mhc-cuda/
+    permissions:
+      id-token: write
+    steps:
+      - name: Download sdist artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sdist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
