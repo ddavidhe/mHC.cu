@@ -20,7 +20,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install build dependencies
-        run: pip install build torch --index-url https://download.pytorch.org/whl/cpu
+        run: |
+          pip install build
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Build sdist
         run: python -m build --sdist
