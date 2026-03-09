@@ -1,17 +1,14 @@
 import os
 import sys
 from setuptools import setup, find_packages
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
 def _is_sdist_build():
+    """Check if we are building a source distribution (no compilation needed)."""
     return "sdist" in sys.argv or "egg_info" in sys.argv
 
 
 def get_cuda_arch_flags():
-    if _is_sdist_build():
-        return []
-
     import torch
 
     cuda_arch = os.environ.get("CUDA_ARCH")
@@ -26,9 +23,6 @@ def get_cuda_arch_flags():
 
 
 def get_extra_defines():
-    if _is_sdist_build():
-        return []
-
     import torch
 
     cuda_arch = os.environ.get("CUDA_ARCH")
@@ -46,17 +40,14 @@ def get_extra_defines():
     return defines
 
 
-setup(
-    name="mhc-cuda",
-    version="0.1.0",
-    description="CUDA implementation of Manifold-Constrained Hyper-Connections",
-    long_description=open("README.md").read() if os.path.exists("README.md") else "",
-    long_description_content_type="text/markdown",
-    author="Andre Slavescu",
-    url="https://github.com/AndreSlavescu/mHC.cu",
-    packages=find_packages(where="src/python"),
-    package_dir={"": "src/python"},
-    ext_modules=[
+# Skip CUDA extension entirely for sdist builds (no CUDA toolkit needed)
+if _is_sdist_build():
+    ext_modules = []
+    cmdclass = {}
+else:
+    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+
+    ext_modules = [
         CUDAExtension(
             name="mhc_cuda",
             sources=["src/python/bindings.cu"],
@@ -83,8 +74,21 @@ setup(
             },
             libraries=["cublas", "cublasLt"],
         )
-    ],
-    cmdclass={"build_ext": BuildExtension},
+    ]
+    cmdclass = {"build_ext": BuildExtension}
+
+setup(
+    name="mhc-cuda",
+    version="0.1.0",
+    description="CUDA implementation of Manifold-Constrained Hyper-Connections",
+    long_description=open("README.md").read() if os.path.exists("README.md") else "",
+    long_description_content_type="text/markdown",
+    author="Andre Slavescu",
+    url="https://github.com/AndreSlavescu/mHC.cu",
+    packages=find_packages(where="src/python"),
+    package_dir={"": "src/python"},
+    ext_modules=ext_modules,
+    cmdclass=cmdclass,
     python_requires=">=3.10",
     install_requires=[
         "accelerate>=0.26.0",
